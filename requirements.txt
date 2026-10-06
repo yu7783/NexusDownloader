@@ -1,0 +1,11 @@
+# Third-party runtime dependencies for Nexus Downloader
+# Install:  pip install -r requirements.txt
+
+PyQt6
+PyQt6-Fluent-Widgets
+requests
+yt-dlp
+
+# --- オプション（一部のアドオンが使用。個別に pip install しても可） ---
+# beautifulsoup4   # HTML 解析（スクレイピング系アドオン）
+# selenium         # 動的サイト取得（Edge ドライバも必要）

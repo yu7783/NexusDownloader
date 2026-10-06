@@ -1,0 +1,42 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.eggs/
+*.egg-info/
+
+# --- Nuitka build artifacts ---
+build/
+main.build/
+main.dist/
+main.onefile-build/
+*.build/
+*.dist/
+*.onefile-build/
+
+# --- Runtime outputs ---
+downloads/
+logs/
+
+# --- Separate addon repository staging (own git repo) ---
+addon-repo/
+
+# --- Personal / third-party addons not meant for the public repo ---
+# (remove this line if you DO want to publish momonga_addon.py)
+addons/momonga_addon.py
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- Local secrets / config backups ---
+config.json.bak
+.env
