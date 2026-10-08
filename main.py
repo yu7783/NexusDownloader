@@ -77,7 +77,15 @@ if _APPLIED_APP_VERSION and not updater.restart_application():
         _APPLIED_APP_VERSION))
     sys.exit(0)
 
-from core import Core, read_manifest, ADDONS_DIR, read_app_version  # noqa: E402
+from core import (  # noqa: E402
+    Core,
+    read_manifest,
+    ADDONS_DIR,
+    read_app_version,
+    normalize_repo_url,
+    repo_base_from_url,
+    join_url,
+)
 from security import scan_text  # noqa: E402
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -917,7 +925,7 @@ class AddonInterface(QWidget):
 
         row = QHBoxLayout()
         self.repo_edit = LineEdit(self)
-        self.repo_edit.setPlaceholderText("アドオンの配布元 URL を入力...")
+        self.repo_edit.setPlaceholderText("アドオンの配布元 URL (github.com/... も可)")
         row.addWidget(self.repo_edit, 1)
 
         self.add_btn = PushButton(FluentIcon.GLOBE, "追加", self)
@@ -947,11 +955,30 @@ class AddonInterface(QWidget):
 
     # -- インストール処理 ---------------------------------------------------
 
-    def _github_to_raw(self, url):
-        """GitHub の通常 URL を raw.githubusercontent.com 形式へ変換する。"""
-        raw = url.replace("github.com", "raw.githubusercontent.com")
-        raw = raw.replace("/blob/", "/").replace("/tree/", "/")
-        return raw.rstrip("/")
+    @staticmethod
+    def _github_to_raw(url):
+        """GitHub の URL を raw 形式のベース URL へ変換する。
+
+        実際の変換は :func:`core.normalize_repo_url` に委譲する
+        （``github.com/<owner>/<repo>/tree/<branch>`` のような HTML URL や
+        ブランチ省略 URL も、連結して使える raw ベース URL に揃える）。
+        """
+        return normalize_repo_url(url)
+
+    @staticmethod
+    def _load_manifest(requests, manifest_url):
+        """マニフェスト（JSON）を取得する。失敗時は原因が分かる例外を送出する。"""
+        try:
+            resp = requests.get(manifest_url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            raise RuntimeError(
+                "マニフェストを取得できませんでした。\nURL: {}\n理由: {}"
+                .format(manifest_url, e))
+        if not isinstance(data, dict):
+            raise RuntimeError("マニフェストの形式が不正です: {}".format(manifest_url))
+        return data
 
     @staticmethod
     def _with_repo_field(content, repo_url):
@@ -974,32 +1001,57 @@ class AddonInterface(QWidget):
         return content[:match.start(1)] + insertion + content[match.end(1):]
 
     def install_from_url(self):
-        """GitHub Repo URL から manifest.json を読み、addon .py を取得・配置する。"""
-        url = self.repo_edit.text().strip()
-        if not url:
+        """リポジトリ URL からマニフェストを読み、アドオン .py を取得・配置する。
+
+        ``https://github.com/<owner>/<repo>/tree/<branch>`` のような **HTML ページ URL**、
+        ブランチを省略した URL、``.py`` を直接指した URL のいずれでも動作する
+        （内部で :func:`core.normalize_repo_url` により raw ベース URL へ正規化する）。
+        """
+        entered = self.repo_edit.text().strip()
+        if not entered:
             return
-        raw = self._github_to_raw(url)
+
+        base = self._github_to_raw(entered)
+        if not base:
+            _info_bar("warning", "入力エラー",
+                      "アドオンの配布元 URL を入力してください。", self)
+            return
+
         try:
             import requests
-            manifest_name = self.core.config.get("update_manifest", "manifest.json")
-            try:
-                r = requests.get(raw + "/" + manifest_name, timeout=10)
-                r.raise_for_status()
-                remote = r.json()
-            except Exception:
-                # manifest.json が無い場合は単一ファイルとして扱う
-                remote = {"addons": [{"file": url.split("/")[-1], "version": "0.0.0"}]}
+
+            if base.lower().endswith(".py"):
+                # .py を直接指定された場合は単一ファイルとして扱う
+                targets = [{"file": base.rsplit("/", 1)[-1], "url": base}]
+            else:
+                manifest_url = join_url(
+                    base, self.core.config.get("update_manifest", "manifest.json"))
+                remote = self._load_manifest(requests, manifest_url)
+                targets = []
+                for item in remote.get("addons", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    fname = item.get("file") or str(item.get("path") or "").rsplit("/", 1)[-1]
+                    if not fname:
+                        continue
+                    rel = str(item.get("path") or "addons/{}".format(fname))
+                    targets.append({"file": fname, "url": join_url(base, rel)})
+                if not targets:
+                    raise RuntimeError(
+                        "マニフェストにインストール可能なアドオンがありません。\nURL: {}"
+                        .format(manifest_url))
+
+            # REPO にはリポジトリ（ブランチ）のベース URL を記録する
+            repo_base = repo_base_from_url(base) if base.lower().endswith(".py") else base
 
             installed = []
-            for item in remote.get("addons", []):
-                fname = item.get("file")
-                if not fname:
-                    continue
-                rel = str(item.get("path") or "addons/{}".format(fname)).strip("/")
-                fr = requests.get(raw + "/" + rel, timeout=20)
-                fr.raise_for_status()
+            for target in targets:
+                resp = requests.get(target["url"], timeout=20)
+                if resp.status_code == 404:
+                    raise RuntimeError("ファイルが見つかりません (404):\n{}".format(target["url"]))
+                resp.raise_for_status()
                 # インストール元を REPO として記録し、以降は各アドオンの repo を見て更新する
-                content = self._with_repo_field(fr.text, raw)
+                content = self._with_repo_field(resp.text, repo_base)
 
                 # セキュリティゲート: 危険コードなら拒否
                 safe, reason = scan_text(content, self.core.guard.blocked_keywords)
@@ -1007,10 +1059,11 @@ class AddonInterface(QWidget):
                     _info_bar("warning", "インストール拒否", reason, self)
                     continue
 
-                dest = os.path.join(ADDONS_DIR, fname)
+                dest = os.path.join(ADDONS_DIR, target["file"])
+                os.makedirs(ADDONS_DIR, exist_ok=True)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(content)
-                installed.append(fname)
+                installed.append(target["file"])
 
             if installed:
                 self.core.addons.clear()
@@ -1095,7 +1148,8 @@ class SettingsInterface(QWidget):
             "本体の自動更新元 (raw 形式のベース URL)", self.update_group)
         self.repo_edit = LineEdit(self.repo_card)
         self.repo_edit.setText(self.core.config.get("github_repo", ""))
-        self.repo_edit.setPlaceholderText("https://raw.githubusercontent.com/user/NexusDownloader/main")
+        self.repo_edit.setPlaceholderText(
+            "https://github.com/user/NexusDownloader  (raw に自動変換されます)")
         self.repo_edit.setMinimumWidth(320)
         self.repo_card.hBoxLayout.addWidget(self.repo_edit, 1, Qt.AlignmentFlag.AlignRight)
         self.repo_card.hBoxLayout.addSpacing(16)
@@ -1317,8 +1371,12 @@ class SettingsInterface(QWidget):
     def save_settings(self):
         keywords = [k.strip() for k in self.keywords_edit.text().split(",") if k.strip()]
         chunk_mb = max(1, self._safe_int(self.chunk_edit.text(), 10))
+        # 本体リポジトリ URL は raw ベース URL へ正規化して保存する
+        # （github.com/.../tree/main のような HTML URL でも 404 にならないように）
+        repo = normalize_repo_url(self.repo_edit.text())
+        self.repo_edit.setText(repo)
         ok, message = self.core.update_config(
-            github_repo=self.repo_edit.text().strip(),
+            github_repo=repo,
             auto_update=self.auto_update_card.isChecked(),
             download_dir=self.dir_card.contentLabel.text(),
             blocked_keywords=keywords,
@@ -1335,7 +1393,8 @@ class SettingsInterface(QWidget):
         _info_bar("success" if ok else "error", "設定", message, self)
 
     def reload_settings(self):
-        self.repo_edit.setText(self.core.config.get("github_repo", ""))
+        self.repo_edit.setText(
+            normalize_repo_url(self.core.config.get("github_repo", "")))
         self.auto_update_card.setValue(bool(self.core.config.get("auto_update", True)))
         self.dir_card.setContent(self.core.download_dir())
         self.keywords_edit.setText(", ".join(self.core.config.get("blocked_keywords", [])))

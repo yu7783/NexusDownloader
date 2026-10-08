@@ -44,3 +44,6 @@ Thumbs.db
 # --- Local secrets / config backups ---
 config.json.bak
 .env
+
+/addons/
+config.json

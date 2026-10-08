@@ -189,6 +189,11 @@ https://site-c.example/page/3
 - 安全のため `addons/` `plugins/` `config.json` は更新対象から除外されます
   （マニフェストに書いても拒否されます）。
 
+> 💡 `github.com/<user>/<repo>` や `https://github.com/<user>/<repo>/tree/<branch>` のような
+> **ブラウザの URL をそのまま貼り付けても OK** です（本体が raw ベース URL へ自動変換します。
+> ブランチを省略した場合は既定ブランチ `HEAD` を使います）。設定タブで「設定を保存」すると
+> 変換後の URL が表示・保存されます。
+
 > ⚠️ Nuitka / PyInstaller で exe 化した場合は `.py` の差し替えが効かないため、
 > 本体の自動更新は **スキップ** します（アドオンの自動更新は exe の外側なので有効です）。
 
@@ -208,6 +213,7 @@ https://site-c.example/page/3
 
 `REPO` には **そのアドオンが配布されているリポジトリの raw ベース URL** を書きます
 （複数アドオンが同じリポジトリを共有しても、アドオンごとに別リポジトリでも構いません）。
+`github.com/<user>/<repo>/tree/<branch>` のような HTML URL でも自動で raw へ変換されます。
 本体は `<REPO>/<update_manifest>` を取得し、`id`（無ければ `file`）が一致するエントリの
 `version` をローカルの `VERSION` と比較して、新しければ `<REPO>/<path>`
 （`path` 省略時は `addons/<file>`）を取得 → セキュリティスキャン → `addons/` を上書きします。

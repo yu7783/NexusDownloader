@@ -22,6 +22,7 @@ import re
 import sys
 import time
 import traceback
+from urllib.parse import urlsplit, urlunsplit
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -111,6 +112,146 @@ def version_gt(v1, v2):
     p1 += [0] * (length - len(p1))
     p2 += [0] * (length - len(p2))
     return p1 > p2
+
+
+# ---------------------------------------------------------------------------
+# URL 正規化（GitHub HTML URL → raw ベース URL）
+# ---------------------------------------------------------------------------
+
+#: GitHub のパスで「表示用」セグメント（除去して raw パスに変換する）
+_GITHUB_VIEW_SEGMENTS = ("tree", "blob", "raw")
+
+#: GitHub のパスで「リポジトリ直下のページ」セグメント（リポジトリ直下へ丸める）
+_GITHUB_PAGE_SEGMENTS = (
+    "releases", "issues", "pulls", "wiki", "actions", "commits", "tags",
+    "branches", "discussions", "settings", "network", "graphs", "security",
+)
+
+
+def _github_content_path(segments):
+    """GitHub のパスセグメントから表示用セグメントを除去して「中身」のパスにする。
+
+    ``<owner>/<repo>/tree/<branch>/sub`` → ``<owner>/<repo>/<branch>/sub``
+    ``<owner>/<repo>/blob/<branch>/x.py`` → ``<owner>/<repo>/<branch>/x.py``
+    ``<owner>/<repo>/releases``           → ``<owner>/<repo>``
+    """
+    if len(segments) >= 3:
+        marker = segments[2].lower()
+        if marker in _GITHUB_VIEW_SEGMENTS:
+            return segments[:2] + segments[3:]
+        if marker in _GITHUB_PAGE_SEGMENTS:
+            return segments[:2]
+    return segments
+
+
+def normalize_repo_url(url):
+    """リポジトリ URL を「raw ベース URL」へ正規化する。
+
+    ``github.com/<owner>/<repo>/tree/<branch>`` のような **HTML ページ URL** を
+    そのまま ``<base>/manifest.json`` として連結すると 404 になるため、
+    連結して使える形へ必ず揃える（ブランチ未指定なら ``HEAD`` を補う）。
+
+    Examples:
+        https://github.com/u/r                          -> https://raw.githubusercontent.com/u/r/HEAD
+        https://github.com/u/r/tree/main                -> https://raw.githubusercontent.com/u/r/main
+        https://github.com/u/r/tree/main/addons         -> https://raw.githubusercontent.com/u/r/main/addons
+        https://github.com/u/r/blob/main/a/x.py         -> https://raw.githubusercontent.com/u/r/main/a/x.py
+        https://github.com/u/r/raw/main/x.py            -> https://raw.githubusercontent.com/u/r/main/x.py
+        https://github.com/u/r/releases                 -> https://raw.githubusercontent.com/u/r/HEAD
+        https://raw.githubusercontent.com/u/r           -> https://raw.githubusercontent.com/u/r/HEAD
+        https://raw.githubusercontent.com/u/r/tree/main -> https://raw.githubusercontent.com/u/r/main
+
+    Args:
+        url: ユーザーが入力した URL（前後の空白・引用符・``<>`` は無視する）。
+
+    Returns:
+        str: 正規化したベース URL。空入力・不正な入力なら空文字列。
+    """
+    text = str(url or "").strip().strip("<>\"'").strip()
+    if not text:
+        return ""
+    # クエリ / フラグメントを落とす
+    text = text.split("#", 1)[0].split("?", 1)[0].strip()
+    if not text:
+        return ""
+    # スキーム省略（github.com/... や //github.com/...）にも対応
+    if text.startswith("//"):
+        text = "https:" + text
+    elif "://" not in text:
+        text = "https://" + text
+
+    parts = urlsplit(text)
+    host = parts.netloc.lower()
+    if "@" in host:  # 認証情報付き URL は扱わない
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+
+    segments = [seg for seg in parts.path.split("/") if seg]
+    if host == "github.com":
+        host = "raw.githubusercontent.com"
+        segments = _github_content_path(segments)
+    elif host == "raw.githubusercontent.com":
+        # raw URL に /tree/ や /blob/ が混ざっている場合も掃除する
+        segments = _github_content_path(segments)
+
+    if host == "raw.githubusercontent.com":
+        if len(segments) < 2:
+            return ""
+        if len(segments) == 2:
+            segments = segments + ["HEAD"]  # ブランチ未指定 → 既定ブランチ(HEAD)
+
+    path = "/".join(segments)
+    return urlunsplit((parts.scheme or "https", host, "/" + path if path else "", "", ""))
+
+
+def join_url(base, *parts):
+    """URL を安全に連結する（スラッシュの重複・欠落を防ぐ）。
+
+    Args:
+        base: ベース URL（末尾スラッシュは自動で除去）。
+        *parts: 連結するパス片（前後のスラッシュは自動で除去）。
+
+    Returns:
+        str: 連結した URL。
+    """
+    url = str(base or "").strip().rstrip("/")
+    if not url:
+        return ""
+    for part in parts:
+        piece = str(part or "").strip().strip("/")
+        if piece:
+            url = "{}/{}".format(url, piece)
+    return url
+
+
+def repo_base_from_url(url):
+    """ファイル URL から「リポジトリ（ブランチ）のベース URL」を取り出す。
+
+    ``.../<branch>/addons/x.py`` → ``.../<branch>``
+    ``.../<branch>/x.py``        → ``.../<branch>``
+
+    スキーム（``https://``）を壊さずに組み立てるため :func:`urlsplit` を使う。
+
+    Args:
+        url: ファイルを指す URL。
+
+    Returns:
+        str: ベース URL。判定できなければ空文字列。
+    """
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    parts = urlsplit(text)
+    segments = [seg for seg in parts.path.split("/") if seg]
+    if len(segments) < 2:
+        return ""
+    if segments[-2].lower() == "addons":
+        segments = segments[:-2]
+    else:
+        segments = segments[:-1]
+    path = "/".join(segments)
+    return urlunsplit((parts.scheme or "https", parts.netloc, "/" + path if path else "", "", "")).rstrip("/")
 # ---------------------------------------------------------------------------
 # 司令塔コア本体
 # ---------------------------------------------------------------------------
@@ -575,12 +716,12 @@ class Core(QObject):
         if updater.is_frozen():
             return "ビルド済み版ではファイル差し替え更新は利用できません"
 
-        base = (self.config.get("github_repo", "") or "").strip().rstrip("/")
+        base = normalize_repo_url(self.config.get("github_repo", ""))
         if not base:
             return "本体リポジトリ URL が未設定です"
 
         manifest_name = self.config.get("update_manifest", "manifest.json")
-        remote = self._fetch_json("{}/{}".format(base, manifest_name))
+        remote = self._fetch_json(join_url(base, manifest_name))
         if remote is None:
             return "本体マニフェストの取得に失敗"
 
@@ -601,7 +742,7 @@ class Core(QObject):
             rel = str(rel).strip()
             if not rel:
                 continue
-            content = self._fetch_text("{}/{}".format(base, rel))
+            content = self._fetch_text(join_url(base, rel))
             if content is None:
                 return "本体ファイルの取得に失敗: {}".format(rel)
 
@@ -625,7 +766,8 @@ class Core(QObject):
         """**各アドオンの REPO** を見て、新しければ ``addons/`` を更新する。
 
         更新元はアドオン自身のマニフェストコメントに書かれた ``REPO``
-        （raw 形式のベース URL）を使う。``REPO`` が無いアドオンは更新対象外。
+        （raw 形式のベース URL。``github.com/.../tree/<branch>`` の HTML URL でも
+        自動で raw へ変換する）を使う。``REPO`` が無いアドオンは更新対象外。
 
         各リポジトリ直下の ``update_manifest``（既定 manifest.json）に::
 
@@ -661,12 +803,13 @@ class Core(QObject):
                 continue
 
             addon_id = manifest.get("ID", filename)
-            repo = (manifest.get("REPO") or "").strip().rstrip("/")
+            # REPO は github.com の HTML URL でも受け付ける（raw ベースへ正規化）
+            repo = normalize_repo_url(manifest.get("REPO"))
             if not repo:
                 no_repo.append(addon_id)
                 continue
 
-            remote = self._fetch_json("{}/{}".format(repo, manifest_name))
+            remote = self._fetch_json(join_url(repo, manifest_name))
             if remote is None:
                 failed.append("{} (マニフェスト取得失敗)".format(addon_id))
                 continue
@@ -681,7 +824,7 @@ class Core(QObject):
                 continue
 
             rel = str(entry.get("path") or "addons/{}".format(entry.get("file") or filename))
-            content = self._fetch_text("{}/{}".format(repo, rel.strip("/")))
+            content = self._fetch_text(join_url(repo, rel))
             if content is None:
                 failed.append("{} (ダウンロード失敗)".format(addon_id))
                 continue

@@ -113,7 +113,22 @@ gh repo create yu7783/NexusDownloader-Addons --public --source=. --remote=origin
 | 本体 | `config.json` の `github_repo` | 本体リポジトリの raw URL |
 | 各アドオン | 各アドオンの `# REPO:` | そのアドオンが置かれたリポジトリの raw URL |
 
-**必ず raw コンテンツ URL** を指定してください（`github.com/...` は HTML を返すため JSON 解析に失敗します）。
+URL は **raw コンテンツ形式**（`raw.githubusercontent.com/.../<branch>`）を推奨しますが、
+`github.com` のブラウザ URL を貼り付けても本体が自動で raw へ変換します
+（`github.com/<owner>/<repo>` は既定ブランチ `HEAD`、`.../tree/<branch>` はそのブランチ）。
+変換は `core.normalize_repo_url()` が担当し、URL の連結ミスによる 404 を防ぎます。
+
+### アドオン追加 URL（アドオン管理タブ）で使える形式
+
+| 入力例 | 解釈 |
+|---|---|
+| `https://github.com/u/r/tree/main` | リポジトリ（branch: main） |
+| `https://github.com/u/r` | リポジトリ（既定ブランチ HEAD） |
+| `https://github.com/u/r/blob/main/addons/x.py` | 単一の `.py` ファイル（REPO も自動記録） |
+| `https://raw.githubusercontent.com/u/r/main` | raw ベース URL（そのまま） |
+
+> マニフェストが見つからない場合は、取得を試みた URL を含むエラーが表示されます
+> （`addons/<最後のセグメント>` のような誤った URL へはフォールバックしません）。
 
 ```jsonc
 // config.json（本体の更新元）

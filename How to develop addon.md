@@ -54,7 +54,7 @@ def download_logic(url, progress_callback, save_dir="downloads"):
 | `NAME` | 任意 | アドオン管理画面に表示される名前（無い場合は `ID` が使われる） |
 | `VERSION` | 任意 | バージョン。自動更新の新旧比較に使用（例 `1.0.2`） |
 | `URL_PATTERNS` | 任意 | 対応 URL の判定パターン。カンマ区切り。部分一致で判定 |
-| `REPO` | 任意 | **このアドオン自身の更新元**（raw ベース URL）。書くと自動更新の対象になる（後述） |
+| `REPO` | 任意 | **このアドオン自身の更新元**（raw ベース URL。`github.com/.../tree/<branch>` の HTML URL も自動変換）。書くと自動更新の対象になる（後述） |
 
 ### パーサの規則（厳密仕様）
 
