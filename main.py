@@ -11,15 +11,18 @@
 
 import json
 import os
+import re
 import sys
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QPlainTextEdit,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -32,6 +35,7 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    PlainTextEdit,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
@@ -58,8 +62,23 @@ from qfluentwidgets import (
     setThemeColor,
 )
 
-from core import Core, read_manifest, ADDONS_DIR  # noqa: F401
-from security import scan_text
+# ---------------------------------------------------------------------------
+# 本体の自動更新（core / security を import する前に適用する）
+# ---------------------------------------------------------------------------
+# updater は標準ライブラリしか使わないため、Qt 初期化前でも安全に呼び出せる。
+# 前回起動時にステージングされた本体更新があれば、ここで本体ファイルへ適用し、
+# 自分自身を再起動して「新旧バージョンが混在した状態」での動作を防ぐ。
+import updater  # noqa: E402
+
+_APPLIED_APP_VERSION = updater.apply_pending_update()
+if _APPLIED_APP_VERSION and not updater.restart_application():
+    # 再起動できなかった場合は、混在動作を避けるためここで終了する
+    print("[Nexus] 本体を v{} に更新しました。アプリを再起動してください。".format(
+        _APPLIED_APP_VERSION))
+    sys.exit(0)
+
+from core import Core, read_manifest, ADDONS_DIR, read_app_version  # noqa: E402
+from security import scan_text  # noqa: E402
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -69,7 +88,7 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Nexus Downloader"
-APP_VERSION = "1.0.0"
+APP_VERSION = read_app_version()
 APP_AUTHOR = "VPTensor35"
 APP_LICENSE = "Apache License 2.0"
 APP_DESCRIPTION = (
@@ -92,6 +111,7 @@ DEFAULT_CONFIG = {
     "accent_color": "#0078D4",
     "auto_update": True,
     "check_interval_hours": 24,
+    "last_update_check": 0,
     "parallel": 4,
     "chunk_size": 10485760,
     "timeout": 30,
@@ -117,6 +137,40 @@ def load_config():
         except Exception:
             pass
     return config
+
+
+# ---------------------------------------------------------------------------
+# 並列ダウンロード
+# ---------------------------------------------------------------------------
+
+#: 並列ダウンロードの上限（回線・メモリ保護のための安全弁）
+MAX_PARALLEL_DOWNLOADS = 16
+
+#: config.json の ``parallel`` が 0 / 未設定のときに使う既定並列数
+DEFAULT_PARALLEL_DOWNLOADS = 4
+
+
+def resolve_parallel_workers(config, task_count):
+    """実際に使う並列ダウンロード数を決める。
+
+    ``config.json`` の ``parallel``（速度テストで自動調整される値）を採用し、
+    ``0`` 以下なら既定値、タスク数と上限（:data:`MAX_PARALLEL_DOWNLOADS`）で
+    クリップした整数を返す。
+
+    Args:
+        config: 設定 dict。
+        task_count: 今回ダウンロードする URL の件数。
+
+    Returns:
+        int: 1 以上 ``MAX_PARALLEL_DOWNLOADS`` 以下の並列数。
+    """
+    try:
+        workers = int(config.get("parallel", 0) or 0)
+    except Exception:
+        workers = 0
+    if workers <= 0:
+        workers = DEFAULT_PARALLEL_DOWNLOADS
+    return max(1, min(workers, max(1, int(task_count)), MAX_PARALLEL_DOWNLOADS))
 
 
 def _info_bar(kind, title, content, parent):
@@ -204,6 +258,91 @@ def _call_download_logic(func, url, progress_callback, save_dir, options):
     return func(url, progress_callback, save_dir)
 
 
+class MultiDownloadWorker(QObject):
+    """複数の URL を並列ダウンロードするワーカー。
+
+    ``run()`` を 1 本のスレッドで動かし、その中で ``ThreadPoolExecutor`` を使う。
+    ワーカー数は ``config.json`` の ``parallel``（上限
+    :data:`MAX_PARALLEL_DOWNLOADS`）で決まる。1 つの URL の失敗は他の URL の
+    ダウンロードを止めず、最後に成功／失敗の件数をまとめて通知する。
+    """
+
+    item_progress = pyqtSignal(str, float, str)  # url, percent, text
+    item_finished = pyqtSignal(str)              # url
+    item_failed = pyqtSignal(str, str)           # url, error
+    overall = pyqtSignal(int, int)               # done, total
+    finished = pyqtSignal(int, int)              # ok, failed
+
+    def __init__(self, core, tasks, save_dir, max_workers=None):
+        super().__init__()
+        self.core = core
+        # tasks: [(url, addon, options), ...]
+        self.tasks = list(tasks)
+        self.save_dir = save_dir
+        self.max_workers = self._resolve_workers(max_workers)
+
+    def _resolve_workers(self, max_workers):
+        """並列数を決める（未指定なら config の ``parallel`` から算出）。"""
+        if max_workers is None:
+            return resolve_parallel_workers(self.core.config, len(self.tasks))
+        try:
+            max_workers = int(max_workers)
+        except Exception:
+            max_workers = 0
+        return max(1, min(max_workers, max(1, len(self.tasks)), MAX_PARALLEL_DOWNLOADS))
+
+    def run(self):
+        """全 URL を並列でダウンロードし、結果をシグナルで通知する。"""
+        total = len(self.tasks)
+        ok = 0
+        failed = 0
+        done = 0
+        self.core.log("[DL] 並列ダウンロード開始: {} 件 (並列数 {})".format(
+            total, self.max_workers))
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers,
+                                    thread_name_prefix="dl") as executor:
+                futures = {}
+                for url, addon, options in self.tasks:
+                    future = executor.submit(self._download_one, url, addon, options)
+                    futures[future] = url
+
+                for future in as_completed(futures):
+                    url = futures[future]
+                    done += 1
+                    try:
+                        result = future.result()
+                        ok += 1
+                        self.core.log("[DL] 完了: {} -> {}".format(url, result))
+                        self.item_finished.emit(url)
+                    except Exception as e:
+                        failed += 1
+                        self.core.log("[DL] 失敗: {} ({})".format(url, e), level="ERROR")
+                        self.item_failed.emit(url, str(e))
+                    self.overall.emit(done, total)
+        except Exception as e:
+            # スレッドプール自体が起動できなかった等の致命エラー
+            failed = max(failed, total - ok)
+            self.core.log("[DL] 並列実行に失敗: {}".format(e), level="ERROR")
+
+        self.finished.emit(ok, failed)
+
+    def _download_one(self, url, addon, options):
+        """1 つの URL をダウンロードする（executor のワーカーから呼ばれる）。"""
+        module = addon["module"]
+        if not hasattr(module, "download_logic"):
+            raise RuntimeError("アドオンに download_logic が定義されていません")
+
+        return _call_download_logic(
+            module.download_logic,
+            url,
+            lambda p, t: self.item_progress.emit(url, float(p), str(t)),
+            self.save_dir,
+            options,
+        )
+
+
 # ---------------------------------------------------------------------------
 # ダウンロード画面
 # ---------------------------------------------------------------------------
@@ -217,6 +356,12 @@ class DownloadInterface(QWidget):
         self.setObjectName("downloadInterface")
         self._thread = None
         self._worker = None
+        # 複数 URL ダウンロードの状態管理
+        self._result_rows = {}   # url -> (dot_label, status_label)
+        self._progress = {}      # url -> 直近の進捗 (%)
+        self._done_urls = set()  # 完了 / 失敗した URL
+        self._active_urls = []   # 今回のタスク URL（全体進捗の母数）
+        self._skipped = 0        # 対応アドオンが無くスキップした件数
         self._build_ui()
 
     def _build_ui(self):
@@ -226,7 +371,9 @@ class DownloadInterface(QWidget):
 
         layout.addWidget(TitleLabel("ダウンロード", self))
 
-        desc = BodyLabel("URL を入力すると、対応するアドオンを自動で選んでダウンロードします。", self)
+        desc = BodyLabel(
+            "URL を入力すると、対応するアドオンを自動で選んでダウンロードします。\n"
+            "改行で区切って複数の URL を入力すると、それらを並列でダウンロードします。", self)
         desc.setTextColor(QColor(160, 160, 160), QColor(120, 120, 120))
         layout.addWidget(desc)
 
@@ -236,11 +383,13 @@ class DownloadInterface(QWidget):
         input_layout.setContentsMargins(20, 18, 20, 18)
         input_layout.setSpacing(12)
 
-        self.url_edit = LineEdit(input_card)
-        self.url_edit.setPlaceholderText("動画やファイルの URL を貼り付けてください...")
-        self.url_edit.setClearButtonEnabled(True)
-        self.url_edit.returnPressed.connect(self.start_download)
-        self.url_edit.setMinimumHeight(38)
+        self.url_edit = PlainTextEdit(input_card)
+        self.url_edit.setPlaceholderText(
+            "動画やファイルの URL を貼り付けてください...\n"
+            "（複数 URL は改行で区切ると並列ダウンロードします）")
+        self.url_edit.setMinimumHeight(84)
+        self.url_edit.setMaximumHeight(160)
+        self.url_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         input_layout.addWidget(self.url_edit)
 
         row = QHBoxLayout()
@@ -312,6 +461,27 @@ class DownloadInterface(QWidget):
         prog_layout.addWidget(self.status)
         layout.addWidget(prog_card)
 
+        # --- 複数 URL の結果一覧カード（複数 URL 指定時のみ表示） ---
+        self.results_card = SimpleCardWidget(self)
+        results_outer = QVBoxLayout(self.results_card)
+        results_outer.setContentsMargins(20, 16, 20, 16)
+        results_outer.setSpacing(10)
+        results_outer.addWidget(StrongBodyLabel("ダウンロード結果", self.results_card))
+
+        self.results_scroll = ScrollArea(self.results_card)
+        self.results_scroll.setWidgetResizable(True)
+        self.results_scroll.setFixedHeight(150)
+        self.results_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self.results_container = QWidget()
+        self.results_layout = QVBoxLayout(self.results_container)
+        self.results_layout.setContentsMargins(0, 0, 0, 0)
+        self.results_layout.setSpacing(6)
+        self.results_scroll.setWidget(self.results_container)
+        results_outer.addWidget(self.results_scroll)
+
+        self.results_card.setVisible(False)  # 初期は非表示
+        layout.addWidget(self.results_card)
+
         # --- ステータスカード ---
         stat_card = SimpleCardWidget(self)
         stat_layout = QHBoxLayout(stat_card)
@@ -347,7 +517,24 @@ class DownloadInterface(QWidget):
 
     # -- アドオンが提示するオプション（画質・音質・拡張子など） -------------
 
-    def _on_url_changed(self, _text):
+    def _input_urls(self):
+        """入力欄（改行区切り）から URL のリストを取り出す。
+
+        - 空行・前後の空白は無視する。
+        - まったく同じ URL が複数行ある場合は 1 件にまとめる（誤操作による二重取得を防ぐ）。
+        """
+        text = self.url_edit.toPlainText().replace("\r\n", "\n").replace("\r", "\n")
+        urls = []
+        seen = set()
+        for line in text.split("\n"):
+            url = line.strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
+
+    def _on_url_changed(self, _text=None):
         """URL 入力が変わったら、対応アドオンの選択肢を再構築する。"""
         self._rebuild_options()
 
@@ -365,9 +552,11 @@ class DownloadInterface(QWidget):
 
         - アドオンが ``get_options()`` を実装している場合のみカードを表示。
         - 各選択肢はラベル＋ComboBox としてグリッド状に並べる。
+        - 複数 URL が入力されている場合は、先頭 URL のアドオンの選択肢を表示する
+          （先頭以外の URL にはアドオンの既定値が使われる）。
         """
-        url = self.url_edit.text().strip()
-        addon = self.core.find_addon_for_url(url) if url else None
+        urls = self._input_urls()
+        addon = self.core.find_addon_for_url(urls[0]) if urls else None
 
         # 同じアドオンなら作り直さない（入力中のチラつき防止）
         if addon is self._current_addon and self._option_widgets:
@@ -382,8 +571,10 @@ class DownloadInterface(QWidget):
             return
 
         # アドオン名・説明を表示
-        self.options_addon_label.setText(
-            "{} が提供するオプション".format(addon.get("name", "アドオン")))
+        note = "{} が提供するオプション".format(addon.get("name", "アドオン"))
+        if len(urls) > 1:
+            note += "（先頭 URL のアドオン。他 {} 件には既定値を適用）".format(len(urls) - 1)
+        self.options_addon_label.setText(note)
 
         row, col = 0, 0
         for key, spec in specs.items():
@@ -419,16 +610,101 @@ class DownloadInterface(QWidget):
         except Exception:
             _info_bar("info", "保存先", path, self)
 
-    def start_download(self):
-        url = self.url_edit.text().strip()
-        if not url:
-            _info_bar("warning", "入力エラー", "URL を入力してください。", self)
-            return
+    # -- 複数 URL の結果一覧 ------------------------------------------------
 
-        addon = self.core.find_addon_for_url(url)
-        if addon is None:
-            _info_bar("error", "アドオン未検出",
-                      "この URL に対応するアドオンが見つかりませんでした。", self)
+    #: 結果一覧に表示する状態マークと配色（light, dark の RGB）
+    _STATE_MARKS = {"idle": "•", "run": "▶", "ok": "✔", "warn": "⚠", "error": "✖"}
+    _STATE_COLORS = {
+        "idle": ((150, 150, 150), (130, 130, 130)),
+        "run": ((0, 120, 212), (76, 160, 235)),
+        "ok": ((16, 137, 62), (84, 190, 120)),
+        "warn": ((196, 110, 0), (230, 150, 40)),
+        "error": ((196, 43, 28), (235, 100, 90)),
+    }
+
+    @staticmethod
+    def _shorten(url, limit=72):
+        """一覧表示用に URL を省略する（中央を ... で詰める）。"""
+        url = str(url)
+        if len(url) <= limit:
+            return url
+        keep = max(4, (limit - 3) // 2)
+        return "{}...{}".format(url[:keep], url[-keep:])
+
+    def _clear_results(self):
+        """結果一覧の行をすべて破棄する。"""
+        self._result_rows = {}
+        while self.results_layout.count():
+            item = self.results_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _add_result_row(self, url, text="待機中...", level="idle"):
+        """URL 1 件分の行（状態マーク + 説明）を結果一覧へ追加する。"""
+        if url in self._result_rows:
+            self._set_result(url, text, level)
+            return
+        row = QWidget(self.results_container)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+
+        dot = BodyLabel(self._STATE_MARKS.get(level, "•"), row)
+        dot.setFixedWidth(16)
+        row_layout.addWidget(dot)
+
+        label = BodyLabel("{}    {}".format(self._shorten(url), text), row)
+        row_layout.addWidget(label, 1)
+
+        self.results_layout.addWidget(row)
+        self._result_rows[url] = (dot, label)
+        self._set_result(url, text, level)
+
+    def _set_result(self, url, text, level="run"):
+        """結果一覧の 1 行の状態表示を更新する。"""
+        entry = self._result_rows.get(url)
+        if entry is None:
+            return
+        dot, label = entry
+        light, dark = self._STATE_COLORS.get(level, self._STATE_COLORS["idle"])
+        dot.setText(self._STATE_MARKS.get(level, "•"))
+        dot.setTextColor(QColor(*light), QColor(*dark))
+        label.setText("{}    {}".format(self._shorten(url), text))
+
+    def _show_results(self, urls, unresolved):
+        """結果一覧カードを初期化して表示する。"""
+        self._clear_results()
+        for url in urls:
+            self._add_result_row(url, "待機中...", "idle")
+        for url in unresolved:
+            self._add_result_row(url, "対応アドオン無し（スキップ）", "warn")
+        self.results_card.setVisible(True)
+
+    def _update_overall_progress(self):
+        """完了件数と進行中タスクの進捗から全体の進捗バーを更新する。"""
+        total = max(1, len(self._active_urls))
+        completed = len(self._done_urls)
+        active = 0.0
+        for url in self._active_urls:
+            if url in self._done_urls:
+                continue
+            active += max(0.0, min(100.0, self._progress.get(url, 0.0))) / 100.0
+        value = int(max(0.0, min(100.0, (completed + active) / total * 100.0)))
+        self.progress.setValue(value)
+        self.percent_label.setText("{}%".format(value))
+
+    # -- 開始 ---------------------------------------------------------------
+
+    def start_download(self):
+        """入力された URL（改行区切りで複数可）のダウンロードを開始する。
+
+        1 件のときは従来どおり単発ダウンロード、2 件以上のときは
+        ``config.json`` の ``parallel`` 数を並列度として並列ダウンロードする。
+        """
+        urls = self._input_urls()
+        if not urls:
+            _info_bar("warning", "入力エラー", "URL を入力してください。", self)
             return
 
         if self._thread is not None and self._thread.is_alive():
@@ -437,25 +713,78 @@ class DownloadInterface(QWidget):
 
         # 選択中のオプション（画質・音質・拡張子など）を取得
         self._rebuild_options()
-        options = self.collect_options()
-        if options:
-            self.status.setText("{} で処理中... ({})".format(
-                addon["name"], ", ".join("{}={}".format(k, v) for k, v in options.items())))
-        else:
-            self.status.setText("{} で処理中...".format(addon["name"]))
+        gui_options = self.collect_options()
+
+        # URL ごとに対応アドオンとオプションを解決
+        tasks = []        # [(url, addon, options), ...]
+        unresolved = []   # 対応アドオンが無かった URL
+        for url in urls:
+            addon = self.core.find_addon_for_url(url)
+            if addon is None:
+                unresolved.append(url)
+                continue
+            # オプションカードに表示中のアドオンなら GUI の選択を使う
+            options = gui_options if addon is self._current_addon \
+                else self.core.default_options(addon)
+            tasks.append((url, addon, options))
+
+        if not tasks:
+            _info_bar("error", "アドオン未検出",
+                      "入力された URL に対応するアドオンが見つかりませんでした。", self)
+            return
 
         self.download_btn.setEnabled(False)
         self.progress.setValue(0)
+        self.percent_label.setText("0%")
+        self._progress = {}
+        self._done_urls = set()
+        self._active_urls = [url for url, _addon, _opt in tasks]
+        self._skipped = len(unresolved)
 
-        worker = DownloadWorker(self.core, addon, url, self.core.download_dir(), options)
-        worker.progress.connect(self._on_progress)
-        worker.finished.connect(self._on_finished)
-        worker.failed.connect(self._on_failed)
+        if len(urls) > 1:
+            # 2 件以上のときだけ結果一覧カードを表示
+            self._show_results(self._active_urls, unresolved)
+        else:
+            self.results_card.setVisible(False)
+
+        if unresolved:
+            _info_bar("warning", "一部スキップ",
+                      "{} 件の URL に対応アドオンが見つかりませんでした。".format(
+                          len(unresolved)), self)
+
+        save_dir = self.core.download_dir()
+
+        # --- 単発（従来の動作を維持） ---
+        if len(self._active_urls) == 1 and not unresolved:
+            url, addon, options = tasks[0]
+            if options:
+                self.status.setText("{} で処理中... ({})".format(
+                    addon["name"], ", ".join("{}={}".format(k, v) for k, v in options.items())))
+            else:
+                self.status.setText("{} で処理中...".format(addon["name"]))
+
+            worker = DownloadWorker(self.core, addon, url, save_dir, options)
+            worker.progress.connect(self._on_progress)
+            worker.finished.connect(self._on_finished)
+            worker.failed.connect(self._on_failed)
+        else:
+            # --- 複数 URL を並列ダウンロード ---
+            workers = resolve_parallel_workers(self.core.config, len(tasks))
+            self.status.setText("{} 件の URL を並列ダウンロード中... (並列数 {})".format(
+                len(tasks), workers))
+
+            worker = MultiDownloadWorker(self.core, tasks, save_dir, workers)
+            worker.item_progress.connect(self._on_item_progress)
+            worker.item_finished.connect(self._on_item_finished)
+            worker.item_failed.connect(self._on_item_failed)
+            worker.finished.connect(self._on_multi_finished)
 
         thread = threading.Thread(target=worker.run, daemon=True)
         self._worker = worker
         self._thread = thread
         thread.start()
+
+    # -- 単発ダウンロードの進捗 ---
 
     def _on_progress(self, percent, text):
         value = int(max(0, min(100, percent)))
@@ -474,6 +803,39 @@ class DownloadInterface(QWidget):
         self.status.setText("失敗しました")
         self.download_btn.setEnabled(True)
         _info_bar("error", "ダウンロード失敗", message.splitlines()[0], self)
+
+    # -- 複数 URL 並列ダウンロードの進捗 ---
+
+    def _on_item_progress(self, url, percent, text):
+        """1 件の URL の進捗を全体進捗と結果一覧へ反映する。"""
+        self._progress[url] = float(percent)
+        self._update_overall_progress()
+        self._set_result(url, "{}% {}".format(int(max(0, min(100, percent))), text), "run")
+        self.status.setText("並列ダウンロード中... {} / {} 件完了".format(
+            len(self._done_urls), len(self._active_urls)))
+
+    def _on_item_finished(self, url):
+        self._progress[url] = 100.0
+        self._done_urls.add(url)
+        self._update_overall_progress()
+        self._set_result(url, "完了", "ok")
+
+    def _on_item_failed(self, url, error):
+        self._done_urls.add(url)
+        self._update_overall_progress()
+        first_line = (error or "").splitlines()[0] if error else "不明なエラー"
+        self._set_result(url, "失敗: {}".format(first_line), "error")
+
+    def _on_multi_finished(self, ok, failed):
+        """並列ダウンロード全体の完了通知。"""
+        self.progress.setValue(100)
+        self.percent_label.setText("100%")
+        message = "成功 {} 件 / 失敗 {} 件".format(ok, failed)
+        if self._skipped:
+            message += " / スキップ {} 件".format(self._skipped)
+        self.status.setText("完了: {}".format(message))
+        self.download_btn.setEnabled(True)
+        _info_bar("success" if failed == 0 else "warning", "ダウンロード完了", message, self)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +863,15 @@ class AddonCard(CardWidget):
         )
         detail.setTextColor(QColor(150, 150, 150), QColor(130, 130, 130))
         info.addWidget(detail)
+
+        repo = (manifest.get("REPO") or "").strip()
+        source = CaptionLabel(
+            "更新元: {}".format(repo) if repo else "更新元: REPO 未設定（自動更新の対象外）",
+            self,
+        )
+        source.setTextColor(QColor(150, 150, 150), QColor(130, 130, 130))
+        info.addWidget(source)
+
         layout.addLayout(info, 1)
 
         self.switch = SwitchButton(self)
@@ -582,6 +953,26 @@ class AddonInterface(QWidget):
         raw = raw.replace("/blob/", "/").replace("/tree/", "/")
         return raw.rstrip("/")
 
+    @staticmethod
+    def _with_repo_field(content, repo_url):
+        """マニフェストに ``REPO`` が無ければ、インストール元 URL を追記する。
+
+        こうすることで、URL から追加したアドオンも次回以降は
+        **そのアドオン自身のリポジトリ** を見て自動更新できるようになる。
+        追記するのは本体が生成したコメント行のみ。
+
+        Returns:
+            str: 書き換え後のソース（REPO が既にある / 追記位置が無い場合はそのまま）。
+        """
+        if re.search(r"^\s*#\s*REPO\s*:", content, re.IGNORECASE | re.MULTILINE):
+            return content
+        version_line = re.compile(r"(^\s*#\s*VERSION\s*:\s*.+?$)", re.IGNORECASE | re.MULTILINE)
+        match = version_line.search(content)
+        if not match:
+            return content
+        insertion = "{}\n# REPO: {}".format(match.group(1), repo_url)
+        return content[:match.start(1)] + insertion + content[match.end(1):]
+
     def install_from_url(self):
         """GitHub Repo URL から manifest.json を読み、addon .py を取得・配置する。"""
         url = self.repo_edit.text().strip()
@@ -590,8 +981,9 @@ class AddonInterface(QWidget):
         raw = self._github_to_raw(url)
         try:
             import requests
+            manifest_name = self.core.config.get("update_manifest", "manifest.json")
             try:
-                r = requests.get(raw + "/manifest.json", timeout=10)
+                r = requests.get(raw + "/" + manifest_name, timeout=10)
                 r.raise_for_status()
                 remote = r.json()
             except Exception:
@@ -603,9 +995,11 @@ class AddonInterface(QWidget):
                 fname = item.get("file")
                 if not fname:
                     continue
-                fr = requests.get(raw + "/addons/" + fname, timeout=20)
+                rel = str(item.get("path") or "addons/{}".format(fname)).strip("/")
+                fr = requests.get(raw + "/" + rel, timeout=20)
                 fr.raise_for_status()
-                content = fr.text
+                # インストール元を REPO として記録し、以降は各アドオンの repo を見て更新する
+                content = self._with_repo_field(fr.text, raw)
 
                 # セキュリティゲート: 危険コードなら拒否
                 safe, reason = scan_text(content, self.core.guard.blocked_keywords)
@@ -655,10 +1049,11 @@ class AddonInterface(QWidget):
             _info_bar("error", "追加失敗", str(e), self)
 
     def check_updates(self):
-        """GitHub からの自動更新を即時実行する。"""
-        result = self.core.auto_update_addons()
+        """本体 (config の本体リポジトリ) と全アドオン (各アドオンの REPO) を今すぐ確認する。"""
+        result = self.core.auto_update_all()
         _info_bar("info", "更新チェック", result, self)
-        if result.startswith("更新完了"):
+        # アドオンが更新されていれば読み込み直す
+        if "更新完了" in result:
             self.core.addons.clear()
             self.core.load_addons()
             self.reload_list()
@@ -696,24 +1091,25 @@ class SettingsInterface(QWidget):
         # --- 更新設定 ---
         self.update_group = SettingCardGroup("更新", container)
         self.repo_card = SettingCard(
-            FluentIcon.GITHUB, "GitHub リポジトリ URL",
-            "アドオン配布リポジトリ (raw 形式のベース URL)", self.update_group)
+            FluentIcon.GITHUB, "本体リポジトリ URL",
+            "本体の自動更新元 (raw 形式のベース URL)", self.update_group)
         self.repo_edit = LineEdit(self.repo_card)
         self.repo_edit.setText(self.core.config.get("github_repo", ""))
-        self.repo_edit.setPlaceholderText("https://raw.githubusercontent.com/user/repo/main")
+        self.repo_edit.setPlaceholderText("https://raw.githubusercontent.com/user/NexusDownloader/main")
         self.repo_edit.setMinimumWidth(320)
         self.repo_card.hBoxLayout.addWidget(self.repo_edit, 1, Qt.AlignmentFlag.AlignRight)
         self.repo_card.hBoxLayout.addSpacing(16)
 
         self.auto_update_card = SwitchSettingCard(
             FluentIcon.SYNC, "自動更新",
-            "起動時に GitHub から最新アドオンを取得します",
+            "起動時に本体とアドオン (各アドオンの REPO) を自動更新します",
             configItem=None, parent=self.update_group)
         self.auto_update_card.setValue(bool(self.core.config.get("auto_update", True)))
 
         self.manifest_card = SettingCard(
             FluentIcon.DOCUMENT, "更新マニフェスト名",
-            "リポジトリ直下に置く JSON ファイルの名前", self.update_group)
+            "本体リポジトリ直下に置く JSON ファイルの名前 (各アドオンの REPO でも使用)",
+            self.update_group)
         self.manifest_edit = LineEdit(self.manifest_card)
         self.manifest_edit.setText(self.core.config.get("update_manifest", "manifest.json"))
         self.manifest_edit.setMinimumWidth(240)
@@ -1072,16 +1468,27 @@ class MainWindow(FluentWindow):
         # セキュリティゲートで拒否されたアドオンを GUI に通知
         core.addon_rejected.connect(self._on_addon_rejected)
 
+        # 本体の更新がステージングされたら通知（次回起動時に自動適用）
+        core.app_update_ready.connect(self._on_app_update_ready)
+
     def _on_addon_rejected(self, name, reason):
         _info_bar("warning", "インストール拒否",
                   "{}\n({})".format(reason, name), self)
 
+    def _on_app_update_ready(self, version):
+        _info_bar("info", "本体の更新",
+                  "v{} を更新準備しました。次回起動時に自動で適用されます。".format(version),
+                  self)
+
 
 def _startup_update(core):
-    """起動時の自動ロード＆アップデートをバックグラウンドで行う（GUI を塞がない）。"""
+    """起動時の自動アップデートをバックグラウンドで行う（GUI を塞がない）。
+
+    本体は config.json の本体リポジトリ、アドオンは各アドオンの REPO を見る。
+    """
     def work():
         try:
-            result = core.auto_update_addons()
+            result = core.auto_update_all()
             core.log("[UPDATE] {}".format(result), level="INFO")
         except Exception:
             print("[UPDATE] 例外: {}".format(traceback.format_exc()))
@@ -1104,10 +1511,11 @@ def main():
     core = Core(config)
     core.load_plugins()    # プラグインを先にロード（logger 等を利用可能に）
     core.load_addons()     # アドオンを動的ロード＆マニフェスト解析
-    _startup_update(core)  # 起動時の自動アップデート（非同期）
 
-    window = MainWindow(core)
+    window = MainWindow(core)   # 更新通知シグナルは MainWindow が受け取る
     window.show()
+
+    _startup_update(core)  # 起動時の自動アップデート（本体 + 各アドオン, 非同期）
     sys.exit(app.exec())
 
 

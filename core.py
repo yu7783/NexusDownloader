@@ -6,7 +6,10 @@ GUI に依存しないロジック層。以下を統括する。
      「アドオン名」「バージョン」「対応URLパターン」を解析して登録する。
   2. プラグイン管理 (plugins/)
   3. URL から最適なアドオンを自動ジャッジ
-  4. GitHub リポジトリからの自動アップデート
+  4. 自動アップデート
+     ・本体: config.json の ``github_repo``（本体リポジトリ）から取得し、
+       次回起動時に適用（updater.py に委譲）
+     ・アドオン: **各アドオンのマニフェストに書かれた ``REPO``** から個別に取得
 
 セキュリティゲートは security.SecurityGuard に委譲する。
 GUI（InfoBar 等）には依存せず、通知は log() と戻り値で行う。
@@ -17,10 +20,12 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+import updater
 from security import SecurityGuard, scan_text
 
 # ---------------------------------------------------------------------------
@@ -31,6 +36,27 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ADDONS_DIR = os.path.join(BASE_DIR, "addons")
 PLUGINS_DIR = os.path.join(BASE_DIR, "plugins")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+VERSION_PATH = os.path.join(BASE_DIR, "version.txt")
+
+#: version.txt が無い場合に使う本体バージョン
+DEFAULT_APP_VERSION = "0.0.0"
+
+#: 本体マニフェストで files が省略されたときに更新するファイル
+DEFAULT_APP_FILES = ["main.py", "core.py", "security.py", "updater.py", "version.txt"]
+
+
+# ---------------------------------------------------------------------------
+# 本体バージョン
+# ---------------------------------------------------------------------------
+
+def read_app_version():
+    """本体バージョン（``version.txt``）を読む。無ければ既定値を返す。"""
+    try:
+        with open(VERSION_PATH, "r", encoding="utf-8") as f:
+            version = f.read().strip()
+        return version or DEFAULT_APP_VERSION
+    except Exception:
+        return DEFAULT_APP_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -39,17 +65,17 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 _MANIFEST_BLOCK = re.compile(r"#\s*-{2,}\s*(?:ADDON|PLUGIN)_MANIFEST\s*-{2,}", re.IGNORECASE)
 _MANIFEST_FIELD = re.compile(
-    r"^\s*#\s*(ID|NAME|VERSION|URL_PATTERNS)\s*:\s*(.+?)\s*$",
+    r"^\s*#\s*(ID|NAME|VERSION|URL_PATTERNS|REPO)\s*:\s*(.+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 
 def read_manifest(path):
-    """ファイル先頭コメントから「アドオン名」「バージョン」「対応URLパターン」を解析する。
+    """ファイル先頭コメントから「アドオン名」「バージョン」「対応URLパターン」「更新元」を解析する。
 
     Returns:
         (manifest: dict | None, text: str)
-        manifest は {"ID":..., "NAME":..., "VERSION":..., "URL_PATTERNS":...}。
+        manifest は {"ID":..., "NAME":..., "VERSION":..., "URL_PATTERNS":..., "REPO":...}。
         ID が無い場合は (None, text) を返す。
     """
     try:
@@ -95,6 +121,7 @@ class Core(QObject):
     addon_loaded = pyqtSignal(dict)
     addon_rejected = pyqtSignal(str, str)
     update_checked = pyqtSignal(str)
+    app_update_ready = pyqtSignal(str)   # 本体の更新をステージングした（新バージョン）
 
     def __init__(self, config):
         super().__init__()
@@ -441,68 +468,244 @@ class Core(QObject):
 
     # -- 自動アップデート ---------------------------------------------------
 
-    def auto_update_addons(self):
-        """config.json の GitHub リポジトリをチェックし、新しければ addons/ を更新する。
+    # __UPDATE_METHODS_PLACEHOLDER__
 
-        manifest.json は {"addons": [{"file": "...", "version": "x.y.z"}, ...]} を想定。
-        取得したファイルもセキュリティスキャンしてから上書き配置する。
+    def _fetch_json(self, url):
+        """JSON を取得する。失敗時はログを残して None を返す。"""
+        try:
+            import requests
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            self.log("[UPDATE] 取得失敗 {}: {}".format(url, e), level="ERROR")
+            return None
+
+    def _fetch_text(self, url):
+        """テキスト（本体/アドオンのソース）を取得する。失敗時は None を返す。"""
+        try:
+            import requests
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:
+            self.log("[UPDATE] 取得失敗 {}: {}".format(url, e), level="ERROR")
+            return None
+
+    @staticmethod
+    def _find_remote_addon(remote, addon_id, filename):
+        """リモートマニフェストから対象アドオンのエントリを探す。
+
+        まず ``id`` の一致、次に ``file`` の一致で探す（``id`` 省略の旧形式にも対応）。
+        """
+        entries = remote.get("addons") or []
+        if not isinstance(entries, list):
+            return None
+        for item in entries:
+            if isinstance(item, dict) and str(item.get("id", "")) == addon_id:
+                return item
+        for item in entries:
+            if isinstance(item, dict) and str(item.get("file", "")) == filename:
+                return item
+        return None
+
+    def _update_due(self):
+        """config の ``check_interval_hours`` から、今チェックすべきか判定する。
+
+        ``0`` の場合は「起動時のみ」＝毎回の起動でチェックする。
+        """
+        try:
+            interval = float(self.config.get("check_interval_hours", 24) or 0)
+        except Exception:
+            interval = 24.0
+        if interval <= 0:
+            return True
+        try:
+            last = float(self.config.get("last_update_check", 0) or 0)
+        except Exception:
+            last = 0.0
+        return (time.time() - last) >= interval * 3600
+
+    def _mark_update_checked(self):
+        """更新チェック時刻を記録する（次回の間隔判定に使う）。"""
+        self.config["last_update_check"] = time.time()
+        self.save_config()
+
+    def auto_update_all(self):
+        """本体と全アドオンをまとめて更新チェックする（起動時・手動チェック用）。
 
         Returns:
             str: 結果メッセージ。
         """
         if not self.config.get("auto_update", True):
             return "自動更新は無効です"
-        base = (self.config.get("github_repo", "") or "").rstrip("/")
-        manifest_name = self.config.get("update_manifest", "manifest.json")
-        if not base:
-            return "リポジトリ URL が未設定です"
+        if not self._update_due():
+            return "更新チェックをスキップしました（前回チェックから間隔未満）"
 
+        app_result = self.check_app_update()
+        addon_result = self.auto_update_addons()
+        self._mark_update_checked()
+
+        result = "本体: {} / アドオン: {}".format(app_result, addon_result)
+        self.update_checked.emit(result)
+        return result
+
+    def check_app_update(self):
+        """本体リポジトリ（config: ``github_repo``）から本体の更新をステージングする。
+
+        マニフェスト（``update_manifest``、既定 manifest.json）は次の形を想定::
+
+            {
+              "app": {
+                "version": "1.1.0",
+                "files": ["main.py", "core.py", "security.py", "updater.py"],
+                "notes": "リリースノート（任意）"
+              }
+            }
+
+        ``files`` を省略した場合は :data:`DEFAULT_APP_FILES` を使う。取得した
+        ファイルはセキュリティスキャン後 ``update/`` にステージングされ、
+        **次回起動時** に適用される（実行中の本体は書き換えない）。
+
+        Returns:
+            str: 結果メッセージ。
+        """
+        if not self.config.get("auto_update", True):
+            return "自動更新は無効です"
+        if updater.is_frozen():
+            return "ビルド済み版ではファイル差し替え更新は利用できません"
+
+        base = (self.config.get("github_repo", "") or "").strip().rstrip("/")
+        if not base:
+            return "本体リポジトリ URL が未設定です"
+
+        manifest_name = self.config.get("update_manifest", "manifest.json")
+        remote = self._fetch_json("{}/{}".format(base, manifest_name))
+        if remote is None:
+            return "本体マニフェストの取得に失敗"
+
+        app_info = remote.get("app")
+        if not isinstance(app_info, dict):
+            app_info = {}
+        remote_version = str(app_info.get("version") or remote.get("version") or "").strip()
+        if not remote_version:
+            return "本体マニフェストに app.version がありません"
+
+        local_version = read_app_version()
+        if not version_gt(remote_version, local_version):
+            return "本体は最新版です (v{})".format(local_version)
+
+        files = app_info.get("files") or DEFAULT_APP_FILES
+        staged = {}
+        for rel in files:
+            rel = str(rel).strip()
+            if not rel:
+                continue
+            content = self._fetch_text("{}/{}".format(base, rel))
+            if content is None:
+                return "本体ファイルの取得に失敗: {}".format(rel)
+
+            safe, reason = scan_text(content, self.guard.blocked_keywords)
+            if not safe:
+                self.log("[SECURITY] 本体更新を拒否: {} ({})".format(rel, reason))
+                return "本体更新を拒否しました ({}): {}".format(rel, reason)
+            staged[rel] = content
+
+        ok, message = updater.stage_update(
+            remote_version, staged,
+            notes=app_info.get("notes", ""), source=base)
+        if not ok:
+            return message
+
+        self.log("[UPDATE] 本体 v{} を更新準備（次回起動時に適用）".format(remote_version))
+        self.app_update_ready.emit(remote_version)
+        return message
+
+    def auto_update_addons(self):
+        """**各アドオンの REPO** を見て、新しければ ``addons/`` を更新する。
+
+        更新元はアドオン自身のマニフェストコメントに書かれた ``REPO``
+        （raw 形式のベース URL）を使う。``REPO`` が無いアドオンは更新対象外。
+
+        各リポジトリ直下の ``update_manifest``（既定 manifest.json）に::
+
+            {"addons": [{"id": "yt_dlp_core", "file": "yt_dlp_addon.py",
+                         "version": "1.2.0",
+                         "path": "addons/yt_dlp_addon.py"}, ...]}
+
+        がある想定（``id`` か ``file`` が一致するエントリを採用。``path`` 省略時は
+        ``addons/<file>``）。取得したファイルはセキュリティスキャンしてから上書きする。
+
+        Returns:
+            str: 結果メッセージ。
+        """
+        if not self.config.get("auto_update", True):
+            return "自動更新は無効です"
         try:
-            import requests
+            import requests  # noqa: F401
         except Exception:
             return "requests がインストールされていないため更新できません"
 
-        try:
-            resp = requests.get("{}/{}".format(base, manifest_name), timeout=10)
-            resp.raise_for_status()
-            remote = resp.json()
-        except Exception as e:
-            return "更新マニフェストの取得に失敗: {}".format(e)
+        if not os.path.isdir(ADDONS_DIR):
+            return "addons フォルダがありません"
 
-        updated = []
-        for item in remote.get("addons", []):
-            filename = item.get("file")
-            new_version = str(item.get("version", ""))
-            if not filename:
+        manifest_name = self.config.get("update_manifest", "manifest.json")
+        updated, failed, no_repo = [], [], []
+
+        for filename in sorted(os.listdir(ADDONS_DIR)):
+            if not filename.endswith(".py") or filename.startswith("_"):
                 continue
             local_path = os.path.join(ADDONS_DIR, filename)
-            local_version = "0.0.0"
-            if os.path.exists(local_path):
-                local_manifest, _ = read_manifest(local_path)
-                if local_manifest:
-                    local_version = local_manifest.get("VERSION", "0.0.0")
+            manifest, _text = read_manifest(local_path)
+            if not manifest:
+                continue
 
-            if version_gt(new_version, local_version):
-                try:
-                    file_resp = requests.get("{}/addons/{}".format(base, filename), timeout=20)
-                    file_resp.raise_for_status()
-                    content = file_resp.text
-                except Exception as e:
-                    self.log("[UPDATE] ダウンロード失敗 {}: {}".format(filename, e), level="ERROR")
-                    continue
+            addon_id = manifest.get("ID", filename)
+            repo = (manifest.get("REPO") or "").strip().rstrip("/")
+            if not repo:
+                no_repo.append(addon_id)
+                continue
 
-                # 更新ファイルもセキュリティスキャンしてから配置
-                safe, reason = scan_text(content, self.guard.blocked_keywords)
-                if not safe:
-                    self.log("[SECURITY] 更新を拒否: {} ({})".format(filename, reason))
-                    continue
+            remote = self._fetch_json("{}/{}".format(repo, manifest_name))
+            if remote is None:
+                failed.append("{} (マニフェスト取得失敗)".format(addon_id))
+                continue
 
-                tmp_path = local_path + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                os.replace(tmp_path, local_path)
-                updated.append("{} -> {}".format(filename, new_version))
+            entry = self._find_remote_addon(remote, addon_id, filename)
+            if not entry:
+                continue
 
-        result = "更新完了: " + ", ".join(updated) if updated else "最新版です"
-        self.update_checked.emit(result)
-        return result
+            remote_version = str(entry.get("version", "")).strip()
+            local_version = manifest.get("VERSION", "0.0.0")
+            if not version_gt(remote_version, local_version):
+                continue
+
+            rel = str(entry.get("path") or "addons/{}".format(entry.get("file") or filename))
+            content = self._fetch_text("{}/{}".format(repo, rel.strip("/")))
+            if content is None:
+                failed.append("{} (ダウンロード失敗)".format(addon_id))
+                continue
+
+            # 更新ファイルもセキュリティスキャンしてから配置
+            safe, reason = scan_text(content, self.guard.blocked_keywords)
+            if not safe:
+                self.log("[SECURITY] 更新を拒否: {} ({})".format(filename, reason))
+                failed.append("{} (セキュリティ拒否)".format(addon_id))
+                continue
+
+            tmp_path = local_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, local_path)
+            updated.append("{} v{} -> v{}".format(filename, local_version, remote_version))
+            self.log("[UPDATE] アドオン更新: {} v{} -> v{}".format(
+                filename, local_version, remote_version))
+
+        parts = []
+        if updated:
+            parts.append("更新完了: " + ", ".join(updated))
+        if failed:
+            parts.append("失敗: " + ", ".join(failed))
+        if no_repo:
+            parts.append("REPO 未設定のためスキップ: " + ", ".join(no_repo))
+        return " / ".join(parts) if parts else "最新版です"

@@ -1,0 +1,14 @@
+{
+    "app": {
+        "version": "1.0.0",
+        "files": [
+            "main.py",
+            "core.py",
+            "security.py",
+            "updater.py",
+            "version.txt"
+        ],
+        "notes": "Nexus Downloader 本体。バージョンを上げてこの manifest.json を push すると、各クライアントの次回起動時に自動で適用されます。"
+    },
+    "addons": []
+}

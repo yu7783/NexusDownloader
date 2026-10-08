@@ -18,6 +18,7 @@
 # NAME: My Site Addon
 # VERSION: 1.0.0
 # URL_PATTERNS: example.com, example.org
+# REPO: https://raw.githubusercontent.com/<user>/<repo>/main
 # ----------------------
 
 def download_logic(url, progress_callback, save_dir="downloads"):
@@ -41,6 +42,7 @@ def download_logic(url, progress_callback, save_dir="downloads"):
 # NAME: <表示名>
 # VERSION: <バージョン>
 # URL_PATTERNS: <パターン1>, <パターン2>, ...
+# REPO: <このアドオンの更新元 raw ベース URL>
 # ----------------------
 ```
 
@@ -50,17 +52,49 @@ def download_logic(url, progress_callback, save_dir="downloads"):
 |---|---|---|
 | `ID` | ✅ **必須** | アドオンを一意に識別する文字列。これが無いと **読み込まれません** |
 | `NAME` | 任意 | アドオン管理画面に表示される名前（無い場合は `ID` が使われる） |
-| `VERSION` | 任意 | バージョン。GitHub 自動更新の新旧比較に使用（例 `1.0.2`） |
+| `VERSION` | 任意 | バージョン。自動更新の新旧比較に使用（例 `1.0.2`） |
 | `URL_PATTERNS` | 任意 | 対応 URL の判定パターン。カンマ区切り。部分一致で判定 |
+| `REPO` | 任意 | **このアドオン自身の更新元**（raw ベース URL）。書くと自動更新の対象になる（後述） |
 
 ### パーサの規則（厳密仕様）
 
 - **開始マーカー**: `#` ＋ ハイフン2個以上 ＋ `ADDON_MANIFEST`（または `PLUGIN_MANIFEST`）＋ ハイフン2個以上
   - 実際の正規表現: `#\s*-{2,}\s*(?:ADDON|PLUGIN)_MANIFEST\s*-{2,}`（大文字小文字は区別しない）
 - **終了**: 開始マーカー以降で最初に現れる `----` までをブロックとして扱う
-- **フィールド行**: `# KEY: value` の形式。`KEY` は `ID` / `NAME` / `VERSION` / `URL_PATTERNS`（大文字小文字不問）
-  - 正規表現: `^\s*#\s*(ID|NAME|VERSION|URL_PATTERNS)\s*:\s*(.+?)\s*$`
+- **フィールド行**: `# KEY: value` の形式。`KEY` は `ID` / `NAME` / `VERSION` / `URL_PATTERNS` / `REPO`（大文字小文字不問）
+  - 正規表現: `^\s*#\s*(ID|NAME|VERSION|URL_PATTERNS|REPO)\s*:\s*(.+?)\s*$`
 - `ID` が無い場合はアドオンとして登録されません。
+
+### 自動更新（`REPO`）のルール
+
+`REPO` を書くと、本体は起動時に **そのアドオン専用の更新元** を見て自動更新します。
+アドオンごとに別リポジトリを持てます（同じリポジトリを共有しても構いません）。
+
+1. `<REPO>/manifest.json`（`config.json` の `update_manifest` 名）を取得する
+2. `id` が `ID` と一致するエントリ（無ければ `file` の一致）を探す
+3. リモートの `version` が、手元の `VERSION` より新しければ
+   `<REPO>/<path>`（`path` 省略時は `addons/<file>`）を取得する
+4. **セキュリティスキャン** を通してから `addons/` のファイルを上書きする
+
+```json
+{
+  "addons": [
+    {
+      "id": "my_site",
+      "file": "my_site_addon.py",
+      "version": "1.1.0",
+      "path": "addons/my_site_addon.py"
+    }
+  ]
+}
+```
+
+| ポイント | 内容 |
+|---|---|
+| `REPO` を書かない場合 | 自動更新の対象外（手動更新のみ） |
+| `VERSION` は必須級 | 無いと `0.0.0` 扱いになるため、必ず更新のたびに上げる |
+| 更新ファイルもスキャンされる | `os.remove` 等のブロック語を含めると更新が拒否される |
+| アドオン管理タブから URL で追加した場合 | 追加元 URL が `REPO` として自動で追記される |
 
 ### URL 判定（`URL_PATTERNS`）のルール
 
@@ -238,6 +272,7 @@ def download_logic(url, progress_callback, save_dir="downloads"):
 # NAME: Universal Video Addon (yt-dlp)
 # VERSION: 1.0.2
 # URL_PATTERNS: youtube.com, youtu.be, twitter.com, x.com, tiktok.com
+# REPO: https://raw.githubusercontent.com/<user>/NexusDownloader-Addons/main
 # ----------------------
 
 import yt_dlp
@@ -281,6 +316,7 @@ def download_logic(url, progress_callback, save_dir="downloads"):
 # NAME: Picture Site Addon
 # VERSION: 1.0.0
 # URL_PATTERNS: pics.example.com
+# REPO: https://raw.githubusercontent.com/<user>/pic-site-addon/main
 # ----------------------
 
 import os
@@ -373,6 +409,7 @@ mod.download_logic("https://example.com/file.bin", cb, "downloads")
 - [ ] 先頭に `# --- ADDON_MANIFEST ---` ブロックがある
 - [ ] `ID` を記入した（必須）
 - [ ] `URL_PATTERNS` にドメイン固有の文字列を指定した
+- [ ] （任意）`REPO` に配布リポジトリの raw ベース URL を書いた（自動更新を使う場合）
 - [ ] `download_logic(url, progress_callback, save_dir, options=None)` を定義した
 - [ ] （任意）画質・音質・拡張子などの選択肢を `get_options()` で提示した
 - [ ] 進捗は `progress_callback(percent, text)` で通知している

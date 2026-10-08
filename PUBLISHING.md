@@ -5,8 +5,8 @@ GitHub に公開する手順を説明します。
 
 | リポジトリ | 用途 | 例 |
 |---|---|---|
-| 本体 | アプリ本体（main.py/core.py/security.py 等） | `yu7783/NexusDownloader` |
-| アドオン | 自動更新で配布するアドオン + manifest.json | `yu7783/NexusDownloader-Addons` |
+| 本体 | アプリ本体（main.py/core.py/security.py/updater.py/version.txt/manifest.json） | `yu7783/NexusDownloader` |
+| アドオン | アドオン配布用（アドオンの `REPO` が指す先） + manifest.json | `yu7783/NexusDownloader-Addons` |
 
 > すでにこのフォルダで `git init` / `git add` / ブランチ `main` 作成済みです
 > （`.gitignore`・`LICENSE`・`requirements.txt` も作成済み）。
@@ -106,24 +106,82 @@ gh repo create yu7783/NexusDownloader-Addons --public --source=. --remote=origin
 
 ## 3. 本体とアドオンリポジトリの接続（重要）
 
-本体は `config.json` の `github_repo` から manifest を取得します。
-**`github.com/...` ではなく raw コンテンツ URL を指定** してください
-（`github.com` は HTML を返すため JSON 解析に失敗します）。
+更新の窓口は **2 系統** です。
 
-| キー | 値 |
-|---|---|
-| `github_repo` | `https://raw.githubusercontent.com/yu7783/NexusDownloader-Addons/main` |
-| `update_manifest` | `manifest.json` |
-| `auto_update` | `true` |
+| 対象 | 更新元 | 設定する場所 |
+|---|---|---|
+| 本体 | `config.json` の `github_repo` | 本体リポジトリの raw URL |
+| 各アドオン | 各アドオンの `# REPO:` | そのアドオンが置かれたリポジトリの raw URL |
 
-> これは `config.json` に **設定済み** です（追記済み）。
-> 設定タブの GUI からも変更できます。
+**必ず raw コンテンツ URL** を指定してください（`github.com/...` は HTML を返すため JSON 解析に失敗します）。
 
-push 後、次の URL で manifest が取得できれば準備完了:
+```jsonc
+// config.json（本体の更新元）
+{
+  "github_repo": "https://raw.githubusercontent.com/yu7783/NexusDownloader/main",
+  "update_manifest": "manifest.json",
+  "auto_update": true,
+  "check_interval_hours": 24
+}
+```
+
+```python
+# addons/yt_dlp_addon.py（このアドオン自身の更新元）
+# REPO: https://raw.githubusercontent.com/yu7783/NexusDownloader-Addons/main
+```
+
+> これは `config.json` に **設定済み** です。設定タブの GUI からも変更できます。
+
+push 後、次の URL で JSON が取得できれば準備完了:
 
 ```
+https://raw.githubusercontent.com/yu7783/NexusDownloader/main/manifest.json
 https://raw.githubusercontent.com/yu7783/NexusDownloader-Addons/main/manifest.json
 ```
+
+### 本体リポジトリに必要なファイル
+
+`manifest.json`（バージョンを上げると各クライアントが次回起動時に自動更新）:
+
+```json
+{
+  "app": {
+    "version": "1.1.0",
+    "files": ["main.py", "core.py", "security.py", "updater.py", "version.txt"],
+    "notes": "v1.1.0: 複数 URL 並列ダウンロード対応"
+  }
+}
+```
+
+- 更新の比較に使うのは **`version.txt` の中身** です。本体を更新したら
+  `version.txt` と `manifest.json` の `version` を **同じ値に** 上げてください。
+- クライアント側は `update/` にステージング → **次回起動時** に適用 → 自己再起動します。
+
+### アドオンリポジトリに必要なファイル
+
+```
+<NexusDownloader-Addons>/
+ ├── manifest.json     # {"addons": [{"id": ..., "file": ..., "version": ..., "path": ...}]}
+ └── addons/
+       └── yt_dlp_addon.py
+```
+
+```json
+{
+  "addons": [
+    {
+      "id": "yt_dlp_core",
+      "file": "yt_dlp_addon.py",
+      "version": "1.2.0",
+      "path": "addons/yt_dlp_addon.py"
+    }
+  ]
+}
+```
+
+- `id` はアドオン側の `# ID:` と一致させます（一致しなければ `file` で照合）。
+- `path` 省略時は `addons/<file>` が使われます。
+- アドオンを更新したら **アドオン内の `# VERSION:`** と `manifest.json` の `version` を上げて push。
 
 ---
 
@@ -131,20 +189,24 @@ https://raw.githubusercontent.com/yu7783/NexusDownloader-Addons/main/manifest.js
 
 1. 本体を起動（`python main.py`）
 2. 起動時に自動更新が走り、コンソール／`logs/downloader.log` に結果が出る
-3. GitHub の URL とローカルの `addons/yt_dlp_addon.py` のバージョンを比較
-4. アドオンを更新したら `manifest.json` の `version` を上げて push
-   → 次回起動時に本体が自動で上書き
+   （例: `本体: 本体は最新版です (v1.0.0) / アドオン: 最新版です`）
+3. 本体を更新した場合は、`update/` にステージングされ次回起動時に適用される
+   （適用ログ: `[UPDATER] 本体を v1.1.0 に更新しました (...)`）
+4. アドオンを更新したら、アドオン内の `# VERSION:` と `manifest.json` の `version` を
+   上げて push → 次回起動時に本体が自動で上書き
 
 > ⚠️ 更新ファイルは実行前に本体の **セキュリティスキャン** を通ります。
 > `os.remove` / `subprocess` 等のブロック語を含めないでください。
 
 ---
 
-## 5. アドオンを追加・更新するフロー（今後の運用）
+## 5. 更新を配布するフロー（今後の運用）
+
+### 5.1 アドオンを更新する
 
 ```powershell
-# 1) アドオンを編集（addon-repo/addons/*.py）
-# 2) manifest.json の該当 version を上げる
+# 1) アドオンを編集（addon-repo/addons/*.py）— マニフェストの # VERSION: も上げる
+# 2) manifest.json の該当 version を同じ値に上げる
 # 3) コミット & push
 cd c:\Users\nnyk0\programings\downloader\addon-repo
 git add -A
@@ -152,7 +214,22 @@ git commit -m "Update yt_dlp_addon to v1.2.0"
 git push
 ```
 
-本体側の `addons/` にもコピーを置いておくと、開発中の動作確認が楽です。
+アドオンを別リポジトリに分けた場合は、そのアドオンのファイルの `# REPO:` を
+**そのリポジトリの raw URL** に書き換えてください（本体側の `config.json` は触りません）。
+
+### 5.2 本体を更新する
+
+```powershell
+cd c:\Users\nnyk0\programings\downloader
+# 1) main.py / core.py / security.py / updater.py 等を編集
+# 2) version.txt と manifest.json の "app".version を同じ値に上げる（例 1.1.0）
+# 3) コミット & push
+git add -A
+git commit -m "Release v1.1.0"
+git push
+```
+
+クライアントは次回起動時に本体を自動更新し、`os.execv` で再起動して新バージョンで動作します。
 
 ---
 
@@ -161,10 +238,13 @@ git push
 | 症状 | 原因 / 対処 |
 |---|---|
 | `updates were rejected` | リモートに既にコミットがある。`git pull --rebase origin main` してから push |
-| 更新マニフェストの取得に失敗 | `github_repo` が `github.com` になっている。`raw.githubusercontent.com` に変更 |
+| 更新マニフェストの取得に失敗 | URL が `github.com` になっている。`raw.githubusercontent.com` に変更 |
 | 404 | ブランチ名不一致（`main` / `master`）。URL のブランチ部分を実際に合わせる |
 | push 時に認証エラー | PAT or SSH 未設定。`gh auth login` か `git config` で設定 |
 | 巨大ファイルで push 遅い | `.gitignore` 漏れ。`build/` 等を除外し `git rm -r --cached build` |
+| 本体が何度も更新される | `version.txt` と `manifest.json` の `version` が不一致。同じ値に揃える |
+| アドオンが更新されない | アドオンに `# REPO:` が無い（`REPO 未設定のためスキップ` と表示される） |
+| `ビルド済み版ではファイル差し替え更新は利用できません` | exe 版は本体の自動更新対象外。新しい exe を配布する |
 
 ---
 
@@ -173,8 +253,10 @@ git push
 - [ ] `git config --global user.name/user.email` を設定した
 - [ ] GitHub に空リポジトリを 2 つ作成した
 - [ ] 本体: `git status` に不要ファイル（build 等）が無いことを確認した
+- [ ] 本体: `manifest.json` と `version.txt` のバージョンを揃えた
 - [ ] 本体: `git push -u origin main` した
 - [ ] アドオン: `addon-repo/` から `git push -u origin main` した
-- [ ] `config.json` の `github_repo` が raw URL になっている
-- [ ] raw の `manifest.json` URL をブラウザで開いて JSON が見えることを確認した
+- [ ] アドオン: 各 `.py` の `# REPO:` が配布先の raw URL になっている
+- [ ] `config.json` の `github_repo` が **本体** の raw URL になっている
+- [ ] raw の `manifest.json` URL（本体 / アドオン）をブラウザで開いて JSON が見えることを確認した
 - [ ] 本体を起動して自動更新のログを確認した

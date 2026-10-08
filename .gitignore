@@ -23,6 +23,10 @@ main.onefile-build/
 downloads/
 logs/
 
+# --- 本体の自動更新ステージング / 適用時のバックアップ ---
+update/
+*.bak
+
 # --- Separate addon repository staging (own git repo) ---
 addon-repo/
 
