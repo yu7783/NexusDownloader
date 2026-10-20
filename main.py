@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -35,6 +36,7 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    PasswordLineEdit,
     PlainTextEdit,
     PrimaryPushButton,
     ProgressBar,
@@ -88,7 +90,9 @@ from core import (  # noqa: E402
 )
 from security import scan_text  # noqa: E402
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ビルド済み（exe）では updater.BASE_DIR が実行ファイルの隣を指す。
+# config.json / addons/ を exe と同じ場所に置いて更新できるようにする。
+BASE_DIR = updater.BASE_DIR
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 # ---------------------------------------------------------------------------
@@ -202,6 +206,32 @@ def _info_bar(kind, title, content, parent):
 # バックグラウンド実行 (マルチスレッド)
 # ---------------------------------------------------------------------------
 
+class _ProgressThrottle(object):
+    """進捗コールバックを間引くラッパー。
+
+    ダウンロードはチャンクごとに進捗を通知するため、そのまま GUI シグナルに
+    変換するとイベントキューが溢れて UI が重くなる。ここでは最大 10 回/秒
+    に制限する（完了通知 ``100%`` は必ず通す）。
+    """
+
+    __slots__ = ("_callback", "_interval", "_last")
+
+    def __init__(self, callback, interval=0.1):
+        self._callback = callback
+        self._interval = interval
+        self._last = 0.0
+
+    def __call__(self, percent, text):
+        percent = float(percent)
+        text = str(text)
+        now = time.monotonic()
+        if percent < 100.0:
+            if now - self._last < self._interval:
+                return
+            self._last = now
+        self._callback(percent, text)
+
+
 class DownloadWorker(QObject):
     """ダウンロード処理を別スレッドに丸投げし、GUI のフリーズを防ぐ。"""
 
@@ -224,8 +254,10 @@ class DownloadWorker(QObject):
                 raise RuntimeError("アドオンに download_logic が定義されていません")
 
             # options に対応したアドオンか確認（後方互換: 未対応なら従来通り呼ぶ）
+            progress_callback = _ProgressThrottle(
+                lambda p, t: self.progress.emit(float(p), str(t)))
             args = _call_download_logic(module.download_logic, self.url,
-                                        lambda p, t: self.progress.emit(float(p), str(t)),
+                                        progress_callback,
                                         self.save_dir, self.options)
             result = args
             self.core.log("[DL] 完了: {} -> {}".format(self.url, result))
@@ -235,32 +267,52 @@ class DownloadWorker(QObject):
             self.failed.emit("{}\n{}".format(e, traceback.format_exc()))
 
 
+#: ``download_logic`` のシグネチャ解析結果キャッシュ（関数 -> 呼び出し方式）
+_DOWNLOAD_SIG_CACHE = {}
+
+
 def _call_download_logic(func, url, progress_callback, save_dir, options):
     """``download_logic`` を後方互換で呼び分ける。
 
     - 引数 ``options`` を受け取れる（または ``**kwargs`` を持つ）場合は渡す。
     - 受け取らない旧式アドオンには、従来の 3 引数で呼び出す。
+
+    シグネチャ解析（``inspect.signature``）は同じ関数に対して 1 度だけ行い、
+    複数 URL の並列ダウンロード時に毎回解析しないようキャッシュする。
     """
-    import inspect
+    mode = _DOWNLOAD_SIG_CACHE.get(func)
+    if mode is None:
+        import inspect
 
-    try:
-        sig = inspect.signature(func)
-        params = sig.parameters
-        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        accepts_options = "options" in params
-        positional = [
-            p for p in params.values()
-            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-    except (TypeError, ValueError):
-        accepts_kwargs = False
-        accepts_options = False
-        positional = []
+        try:
+            params = inspect.signature(func).parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            accepts_options = "options" in params
+            positional = [
+                p for p in params.values()
+                if p.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+        except (TypeError, ValueError):
+            accepts_kwargs = False
+            accepts_options = False
+            positional = []
 
-    if accepts_kwargs or accepts_options:
+        if accepts_kwargs or accepts_options:
+            mode = "kwargs"
+        elif len(positional) >= 4:
+            mode = "positional"
+        else:
+            mode = "legacy"
+        _DOWNLOAD_SIG_CACHE[func] = mode
+
+    if mode == "kwargs":
         # キーワードで options を渡せる（**kwargs / options 引数あり）
         return func(url, progress_callback, save_dir, options=options)
-    if len(positional) >= 4:
+    if mode == "positional":
         # 位置引数で 4 番目が options
         return func(url, progress_callback, save_dir, options)
     return func(url, progress_callback, save_dir)
@@ -342,10 +394,13 @@ class MultiDownloadWorker(QObject):
         if not hasattr(module, "download_logic"):
             raise RuntimeError("アドオンに download_logic が定義されていません")
 
+        # チャンクごとの進捗をそのまま emit すると GUI が詰まるため間引く
+        progress_callback = _ProgressThrottle(
+            lambda p, t: self.item_progress.emit(url, float(p), str(t)))
         return _call_download_logic(
             module.download_logic,
             url,
-            lambda p, t: self.item_progress.emit(url, float(p), str(t)),
+            progress_callback,
             self.save_dir,
             options,
         )
@@ -367,9 +422,17 @@ class DownloadInterface(QWidget):
         # 複数 URL ダウンロードの状態管理
         self._result_rows = {}   # url -> (dot_label, status_label)
         self._progress = {}      # url -> 直近の進捗 (%)
+        self._progress_sum = 0.0  # 進捗の合計（全体進捗を O(1) で計算するため）
         self._done_urls = set()  # 完了 / 失敗した URL
         self._active_urls = []   # 今回のタスク URL（全体進捗の母数）
         self._skipped = 0        # 対応アドオンが無くスキップした件数
+
+        # URL 入力中に毎キーストロークで選択肢を作り直さないためのデバウンス
+        self._options_timer = QTimer(self)
+        self._options_timer.setSingleShot(True)
+        self._options_timer.setInterval(120)
+        self._options_timer.timeout.connect(self._rebuild_options)
+
         self._build_ui()
 
     def _build_ui(self):
@@ -430,7 +493,7 @@ class DownloadInterface(QWidget):
         self.options_addon_label.setTextColor(QColor(150, 150, 150), QColor(130, 130, 130))
         opt_outer.addWidget(self.options_addon_label)
 
-        # 動的生成されたコンボボックスを並べるグリッド
+        # 動的生成された入力ウィジェット（ComboBox / LineEdit）を並べるグリッド
         self.options_grid = QGridLayout()
         self.options_grid.setHorizontalSpacing(24)
         self.options_grid.setVerticalSpacing(10)
@@ -440,7 +503,7 @@ class DownloadInterface(QWidget):
         self.options_card.setVisible(False)  # 初期は非表示
         layout.addWidget(self.options_card)
 
-        self._option_widgets = {}   # key -> (ComboBox, spec)
+        self._option_widgets = {}   # key -> (QWidget, spec)
         self._current_addon = None  # 現在オプションを表示中のアドオン
 
         # URL 入力の変化に追従してオプションを再構築
@@ -543,8 +606,11 @@ class DownloadInterface(QWidget):
         return urls
 
     def _on_url_changed(self, _text=None):
-        """URL 入力が変わったら、対応アドオンの選択肢を再構築する。"""
-        self._rebuild_options()
+        """URL 入力が変わったら、対応アドオンの選択肢を再構築する。
+
+        タイプ中の連続呼び出しを避けるため 120ms のデバウンスをかける。
+        """
+        self._options_timer.start()
 
     def _clear_options(self):
         """生成済みの選択肢ウィジェットを破棄する。"""
@@ -559,10 +625,13 @@ class DownloadInterface(QWidget):
         """現在の URL に対応するアドオンの選択肢を GUI に反映する。
 
         - アドオンが ``get_options()`` を実装している場合のみカードを表示。
-        - 各選択肢はラベル＋ComboBox としてグリッド状に並べる。
+        - 各項目はラベル＋入力ウィジェットとしてグリッド状に並べる。
+          ``type`` が ``select`` なら ComboBox、``password`` なら PasswordLineEdit、
+          それ以外（``text``）は LineEdit を使う。
         - 複数 URL が入力されている場合は、先頭 URL のアドオンの選択肢を表示する
           （先頭以外の URL にはアドオンの既定値が使われる）。
         """
+        self._options_timer.stop()
         urls = self._input_urls()
         addon = self.core.find_addon_for_url(urls[0]) if urls else None
 
@@ -587,16 +656,11 @@ class DownloadInterface(QWidget):
         row, col = 0, 0
         for key, spec in specs.items():
             label = BodyLabel(spec["label"], self.options_card)
-            combo = ComboBox(self.options_card)
-            combo.addItems(spec["options"])
-            combo.setCurrentText(spec["default"])
-            combo.setMinimumWidth(140)
-            if spec.get("content"):
-                combo.setToolTip(spec["content"])
+            widget = self._make_option_widget(spec)
 
             self.options_grid.addWidget(label, row, col * 2)
-            self.options_grid.addWidget(combo, row, col * 2 + 1)
-            self._option_widgets[key] = (combo, spec)
+            self.options_grid.addWidget(widget, row, col * 2 + 1)
+            self._option_widgets[key] = (widget, spec)
 
             col += 1
             if col >= 3:  # 1 行に最大 3 項目
@@ -606,9 +670,50 @@ class DownloadInterface(QWidget):
         self.options_grid.setColumnStretch(col * 2 + 2, 1)
         self.options_card.setVisible(True)
 
+    def _make_option_widget(self, spec):
+        """オプション定義から入力ウィジェットを生成する（``type`` で種類を切替）。
+
+        - ``select``（既定）: ComboBox。``options`` の選択肢を並べる。
+        - ``password``      : PasswordLineEdit（伏せ字の 1 行入力）。
+        - ``text``          : LineEdit（1 行入力）。
+        """
+        kind = spec.get("type", "select")
+
+        if kind in ("text", "password"):
+            widget = (PasswordLineEdit(self.options_card) if kind == "password"
+                      else LineEdit(self.options_card))
+            widget.setText(spec.get("default", ""))
+            widget.setMinimumWidth(180)
+            widget.setClearButtonEnabled(True)
+            if spec.get("content"):
+                widget.setPlaceholderText(spec["content"])
+                widget.setToolTip(spec["content"])
+        else:
+            widget = ComboBox(self.options_card)
+            widget.addItems(spec["options"])
+            widget.setCurrentText(spec["default"])
+            widget.setMinimumWidth(140)
+            if spec.get("content"):
+                widget.setToolTip(spec["content"])
+        return widget
+
     def collect_options(self):
-        """現在 GUI で選択されているオプションを dict にして返す。"""
-        return {key: combo.currentText() for key, (combo, _spec) in self._option_widgets.items()}
+        """現在 GUI で選択・入力されているオプションを dict にして返す。
+
+        ComboBox は選択中のテキスト、テキスト入力は入力値を文字列で返す。
+        パスワードは前後の空白を保持したまま渡す（その他の値は strip する）。
+        """
+        result = {}
+        for key, (widget, spec) in self._option_widgets.items():
+            if spec.get("type", "select") in ("text", "password"):
+                value = widget.text()
+                if spec.get("type") == "password":
+                    result[key] = value
+                else:
+                    result[key] = value.strip()
+            else:
+                result[key] = widget.currentText()
+        return result
 
     def _open_download_dir(self):
         import os as _os
@@ -689,15 +794,22 @@ class DownloadInterface(QWidget):
             self._add_result_row(url, "対応アドオン無し（スキップ）", "warn")
         self.results_card.setVisible(True)
 
+    def _set_progress(self, url, percent):
+        """1 件分の進捗を差分更新する（全 URL を毎回走査しない）。"""
+        percent = max(0.0, min(100.0, float(percent)))
+        old = self._progress.get(url, 0.0)
+        self._progress_sum += percent - old
+        self._progress[url] = percent
+
     def _update_overall_progress(self):
-        """完了件数と進行中タスクの進捗から全体の進捗バーを更新する。"""
+        """完了件数と進行中タスクの進捗から全体の進捗バーを更新する。
+
+        進捗の合計は :meth:`_set_progress` で差分更新しているため、
+        ここでは O(1) で計算できる（URL が増えても重くならない）。
+        """
         total = max(1, len(self._active_urls))
         completed = len(self._done_urls)
-        active = 0.0
-        for url in self._active_urls:
-            if url in self._done_urls:
-                continue
-            active += max(0.0, min(100.0, self._progress.get(url, 0.0))) / 100.0
+        active = max(0.0, self._progress_sum) / 100.0
         value = int(max(0.0, min(100.0, (completed + active) / total * 100.0)))
         self.progress.setValue(value)
         self.percent_label.setText("{}%".format(value))
@@ -745,6 +857,7 @@ class DownloadInterface(QWidget):
         self.progress.setValue(0)
         self.percent_label.setText("0%")
         self._progress = {}
+        self._progress_sum = 0.0
         self._done_urls = set()
         self._active_urls = [url for url, _addon, _opt in tasks]
         self._skipped = len(unresolved)
@@ -816,19 +929,20 @@ class DownloadInterface(QWidget):
 
     def _on_item_progress(self, url, percent, text):
         """1 件の URL の進捗を全体進捗と結果一覧へ反映する。"""
-        self._progress[url] = float(percent)
+        self._set_progress(url, percent)
         self._update_overall_progress()
         self._set_result(url, "{}% {}".format(int(max(0, min(100, percent))), text), "run")
         self.status.setText("並列ダウンロード中... {} / {} 件完了".format(
             len(self._done_urls), len(self._active_urls)))
 
     def _on_item_finished(self, url):
-        self._progress[url] = 100.0
+        self._set_progress(url, 100.0)
         self._done_urls.add(url)
         self._update_overall_progress()
         self._set_result(url, "完了", "ok")
 
     def _on_item_failed(self, url, error):
+        self._set_progress(url, 100.0)  # 失敗も「処理済み」として進捗を完了させる
         self._done_urls.add(url)
         self._update_overall_progress()
         first_line = (error or "").splitlines()[0] if error else "不明なエラー"
@@ -1066,7 +1180,7 @@ class AddonInterface(QWidget):
                 installed.append(target["file"])
 
             if installed:
-                self.core.addons.clear()
+                self.core.clear_addons()
                 self.core.load_addons()
                 self.reload_list()
                 _info_bar("success", "追加完了", ", ".join(installed), self)
@@ -1094,7 +1208,7 @@ class AddonInterface(QWidget):
             dest = os.path.join(ADDONS_DIR, os.path.basename(path))
             with open(dest, "w", encoding="utf-8") as f:
                 f.write(content)
-            self.core.addons.clear()
+            self.core.clear_addons()
             self.core.load_addons()
             self.reload_list()
             _info_bar("success", "追加完了", manifest.get("NAME", os.path.basename(path)), self)
@@ -1107,7 +1221,7 @@ class AddonInterface(QWidget):
         _info_bar("info", "更新チェック", result, self)
         # アドオンが更新されていれば読み込み直す
         if "更新完了" in result:
-            self.core.addons.clear()
+            self.core.clear_addons()
             self.core.load_addons()
             self.reload_list()
 
@@ -1550,12 +1664,66 @@ def _startup_update(core):
             result = core.auto_update_all()
             core.log("[UPDATE] {}".format(result), level="INFO")
         except Exception:
-            print("[UPDATE] 例外: {}".format(traceback.format_exc()))
+            try:
+                print("[UPDATE] 例外: {}".format(traceback.format_exc()))
+            except Exception:
+                pass
 
     threading.Thread(target=work, daemon=True).start()
 
 
+def _run_self_test(output_path):
+    """ビルド済み exe の動作確認用の軽量セルフテスト。
+
+    GUI を起動せずに、設定・アドオンの読み込みと各アドオンの遅延 import が
+    成功するかを JSON に書き出す。``NexusDownloader.exe --self-test out.json``
+    のように呼び出す（通常の利用には影響しない）。
+    """
+    report = {
+        "base_dir": BASE_DIR,
+        "version": APP_VERSION,
+        "frozen": updater.is_frozen(),
+        "addons": {},
+    }
+    try:
+        core = Core(load_config())
+        core.load_plugins()
+        core.load_addons()
+        report["addon_count"] = len(core.addons)
+        for addon_id, entry in core.addons.items():
+            try:
+                module = entry["module"]
+                # 属性アクセスで遅延 import を実行する
+                getattr(module, "download_logic", None)
+                report["addons"][addon_id] = {
+                    "status": "ok",
+                    "name": entry.get("name"),
+                    "options": list(core.get_addon_options(entry)),
+                }
+            except Exception as e:  # noqa: BLE001 - 結果をファイルに残す
+                report["addons"][addon_id] = {
+                    "status": "error",
+                    "error": "{}: {}".format(type(e).__name__, e),
+                }
+        report["status"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        report["status"] = "error"
+        report["error"] = "{}: {}".format(type(e).__name__, e)
+        report["traceback"] = traceback.format_exc()
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    return report.get("status") == "ok"
+
+
 def main():
+    if "--self-test" in sys.argv:
+        index = sys.argv.index("--self-test")
+        output = (sys.argv[index + 1] if len(sys.argv) > index + 1
+                  else os.path.join(BASE_DIR, "selftest.json"))
+        _run_self_test(output)
+        return
+
     config = load_config()
 
     # テーマ設定（Windows 11 純正風ダークモード + アクセントカラー）
@@ -1574,6 +1742,7 @@ def main():
     window = MainWindow(core)   # 更新通知シグナルは MainWindow が受け取る
     window.show()
 
+    core.warm_up_addons()  # 重い import を表示後に裏で先読み（初回操作を固めない）
     _startup_update(core)  # 起動時の自動アップデート（本体 + 各アドオン, 非同期）
     sys.exit(app.exec())
 

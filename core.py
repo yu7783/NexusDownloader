@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from urllib.parse import urlsplit, urlunsplit
@@ -30,10 +31,10 @@ import updater
 from security import SecurityGuard, scan_text
 
 # ---------------------------------------------------------------------------
-# パス定数（このファイルの位置を基準にする）
+# パス定数（ソース実行時はこのファイルの位置、ビルド済みは exe の位置を基準）
 # ---------------------------------------------------------------------------
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = updater.BASE_DIR
 ADDONS_DIR = os.path.join(BASE_DIR, "addons")
 PLUGINS_DIR = os.path.join(BASE_DIR, "plugins")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -41,6 +42,14 @@ VERSION_PATH = os.path.join(BASE_DIR, "version.txt")
 
 #: version.txt が無い場合に使う本体バージョン
 DEFAULT_APP_VERSION = "0.0.0"
+
+
+def _safe_print(message):
+    """標準出力が無い環境（--windowed ビルド）でも落ちない print。"""
+    try:
+        print(message)
+    except Exception:
+        pass
 
 #: 本体マニフェストで files が省略されたときに更新するファイル
 DEFAULT_APP_FILES = ["main.py", "core.py", "security.py", "updater.py", "version.txt"]
@@ -71,23 +80,28 @@ _MANIFEST_FIELD = re.compile(
 )
 
 
-def read_manifest(path):
-    """ファイル先頭コメントから「アドオン名」「バージョン」「対応URLパターン」「更新元」を解析する。
-
-    Returns:
-        (manifest: dict | None, text: str)
-        manifest は {"ID":..., "NAME":..., "VERSION":..., "URL_PATTERNS":..., "REPO":...}。
-        ID が無い場合は (None, text) を返す。
-    """
+def read_text(path):
+    """UTF-8 テキストを読む。失敗時は None を返す。"""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+            return f.read()
     except Exception:
-        return None, ""
+        return None
 
+
+def parse_manifest(text):
+    """ソース文字列の先頭コメントからマニフェストを解析する。
+
+    ファイルを再度開かずに済むよう、:func:`read_manifest` から分離している。
+
+    Returns:
+        dict | None: ``{"ID":..., "NAME":..., ...}``。ID が無ければ ``None``。
+    """
+    if not text:
+        return None
     match = _MANIFEST_BLOCK.search(text)
     if not match:
-        return None, text
+        return None
 
     # マニフェストブロックの開始行から終了行までを抽出
     end_marker = text.find("----", match.end())
@@ -97,9 +111,21 @@ def read_manifest(path):
     for m in _MANIFEST_FIELD.finditer(block):
         manifest[m.group(1).upper()] = m.group(2).strip()
 
-    if "ID" not in manifest:
-        return None, text
-    return manifest, text
+    return manifest if "ID" in manifest else None
+
+
+def read_manifest(path):
+    """ファイル先頭コメントから「アドオン名」「バージョン」「対応URLパターン」「更新元」を解析する。
+
+    Returns:
+        (manifest: dict | None, text: str)
+        manifest は {"ID":..., "NAME":..., "VERSION":..., "URL_PATTERNS":..., "REPO":...}。
+        ID が無い場合は (None, text) を返す。
+    """
+    text = read_text(path)
+    if text is None:
+        return None, ""
+    return parse_manifest(text), text
 
 
 def version_gt(v1, v2):
@@ -253,6 +279,67 @@ def repo_base_from_url(url):
     path = "/".join(segments)
     return urlunsplit((parts.scheme or "https", parts.netloc, "/" + path if path else "", "", "")).rstrip("/")
 # ---------------------------------------------------------------------------
+# 遅延ロード用モジュールプロキシ
+# ---------------------------------------------------------------------------
+
+class LazyAddonModule(object):
+    """アドオンの ``.py`` を「実際に使うとき」まで import しないプロキシ。
+
+    アドオンは ``yt_dlp`` / ``bs4`` / ``requests`` など重い依存を import して
+    いることが多く、起動時に全アドオンを実行すると起動時間が伸びる。ここでは
+    マニフェスト解析とセキュリティスキャン（テキストのみ）だけを起動時に行い、
+    モジュール本体の実行は最初の属性アクセス（``download_logic`` /
+    ``get_options`` など）まで遅延させる。
+
+    実際の import は属性アクセス時に 1 度だけ行われ、以降は本物のモジュールを
+    そのまま返す。複数スレッドから同時にアクセスされても二重 import しない。
+    """
+
+    __slots__ = ("_path", "_module_name", "_loader", "_module", "_lock", "_error")
+
+    def __init__(self, path, module_name, loader):
+        self._path = path
+        self._module_name = module_name
+        self._loader = loader
+        self._module = None
+        self._error = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        module = self._module
+        if module is not None:
+            return module
+        if self._error is not None:
+            raise RuntimeError(self._error)
+        with self._lock:
+            if self._module is not None:
+                return self._module
+            if self._error is not None:
+                raise RuntimeError(self._error)
+            try:
+                module = self._loader(self._path, self._module_name)
+            except Exception as e:  # noqa: BLE001 - 呼び出し側へ理由を伝える
+                self._error = "アドオンの読み込みに失敗しました: {} ({})".format(
+                    os.path.basename(self._path), e)
+                raise RuntimeError(self._error)
+            if module is None:
+                self._error = "アドオンの読み込みに失敗しました: {}".format(
+                    os.path.basename(self._path))
+                raise RuntimeError(self._error)
+            self._module = module
+            return module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+    def __dir__(self):
+        try:
+            return dir(self._load())
+        except Exception:
+            return []
+
+
+# ---------------------------------------------------------------------------
 # 司令塔コア本体
 # ---------------------------------------------------------------------------
 
@@ -270,6 +357,15 @@ class Core(QObject):
         self.guard = SecurityGuard(config.get("blocked_keywords"))
         self.addons = {}      # id -> {"manifest":..., "module":..., "path":..., "enabled":...}
         self._plugins = {}    # name -> instance
+
+        # URL パターン索引（入力のたびに全アドオンを走査しないためのキャッシュ）
+        self._url_index = None
+        self._url_index_count = -1
+        # アドオンの get_options() 結果キャッシュ
+        self._options_cache = {}
+        # 更新取得用の HTTP セッション（初回使用時に生成 = 起動時 import を回避）
+        self._session = None
+        self._session_lock = threading.Lock()
 
     # -- 設定 ---------------------------------------------------------------
 
@@ -337,8 +433,6 @@ class Core(QObject):
                 "message": str,
             }
         """
-        import time
-
         # 計測用の小さなファイル（複数のミラーを順に試す）
         urls = [
             "https://speed.cloudflare.com/__down?bytes=2000000",
@@ -353,15 +447,16 @@ class Core(QObject):
         }
 
         speed_kib = 0.0
+        session = self.http_session()
+        # 計測中はプロキシ等の設定をそのまま使うが、リトライで時間を無駄にしない
         for url in urls:
             try:
-                import requests
                 start = time.time()
-                resp = requests.get(url, timeout=timeout, stream=True)
+                resp = session.get(url, timeout=timeout, stream=True)
                 resp.raise_for_status()
 
                 downloaded = 0
-                for chunk in resp.iter_content(chunk_size=65536):
+                for chunk in resp.iter_content(chunk_size=256 * 1024):
                     if not chunk:
                         continue
                     downloaded += len(chunk)
@@ -421,8 +516,21 @@ class Core(QObject):
 
     # -- 動的インポート & マニフェスト解析 ----------------------------------
 
+    def clear_addons(self):
+        """登録済みアドオンと関連キャッシュを破棄する。"""
+        self.addons.clear()
+        self._url_index = None
+        self._url_index_count = -1
+        self._options_cache.clear()
+
     def load_addons(self):
-        """addons/ 内の .py ファイルをスキャンし、動的にロード・登録する。"""
+        """addons/ 内の .py ファイルをスキャンし、動的にロード・登録する。
+
+        起動時間を短縮するため、ここでは **ファイルを 1 度読むだけ** で
+        マニフェスト解析・セキュリティスキャン・構文チェックだけを行い、
+        モジュール本体の実行（重い import を含む）は
+        :class:`LazyAddonModule` により初回利用時まで遅延させる。
+        """
         os.makedirs(ADDONS_DIR, exist_ok=True)
         loaded = []
         for name in sorted(os.listdir(ADDONS_DIR)):
@@ -430,23 +538,35 @@ class Core(QObject):
                 continue
             path = os.path.join(ADDONS_DIR, name)
 
-            # 1) マニフェスト解析
-            manifest, _ = read_manifest(path)
+            # 1) ファイルは 1 度だけ読む（以前はマニフェスト + スキャンで 2 回読んでいた）
+            text = read_text(path)
+            if text is None:
+                self.log("[WARN] 読み込めません、スキップ: {}".format(name))
+                continue
+
+            # 2) マニフェスト解析
+            manifest = parse_manifest(text)
             if manifest is None:
                 self.log("[WARN] マニフェストなし、スキップ: {}".format(name))
                 continue
 
-            # 2) セキュリティゲート（実行前にテキストスキャン）
-            safe, reason = self.guard.scan(path)
+            # 3) セキュリティゲート（実行前にテキストスキャン）
+            safe, reason = scan_text(text, self.guard.blocked_keywords)
             if not safe:
                 self.log("[SECURITY] アドオンを拒否: {} ({})".format(name, reason))
                 self.addon_rejected.emit(name, reason)
                 continue
 
-            # 3) 動的インポート
-            module = self._import_module(path, "addon_" + manifest["ID"])
-            if module is None:
+            # 4) 構文チェックだけ先に行う（import はしない = 高速 & 安全）
+            try:
+                compile(text, path, "exec")
+            except SyntaxError as e:
+                self.log("[ERROR] 構文エラーのためスキップ: {} ({})".format(name, e),
+                         level="ERROR")
                 continue
+
+            # 5) 遅延ロード用プロキシを登録
+            module = LazyAddonModule(path, "addon_" + manifest["ID"], self._import_module)
 
             previous = self.addons.get(manifest["ID"])
             entry = {
@@ -461,7 +581,33 @@ class Core(QObject):
             self.addon_loaded.emit(entry)
             self.log("[LOAD] アドオン登録: {} v{}".format(
                 entry["name"], manifest.get("VERSION", "-")))
+
+        self._url_index = None
+        self._url_index_count = -1
+        self._options_cache.clear()
+        self._rebuild_url_index()
         return loaded
+
+    def warm_up_addons(self):
+        """アドオンの import をバックグラウンドで先読みする。
+
+        :class:`LazyAddonModule` により起動は高速だが、初回 URL 入力時に
+        GUI スレッドで import すると一瞬固まる。ウィンドウ表示後に裏で
+        読み込んでおくことで、起動速度と操作感を両立する。
+        """
+        def work():
+            for entry in list(self.addons.values()):
+                module = entry.get("module")
+                if module is None:
+                    continue
+                try:
+                    # 属性アクセスで遅延 import が走る
+                    getattr(module, "download_logic", None)
+                except Exception:
+                    # 壊れたアドオンは利用時にエラーを出すのでここでは無視
+                    pass
+
+        threading.Thread(target=work, name="addon-warmup", daemon=True).start()
 
     def _import_module(self, path, module_name):
         """ファイルパスからモジュールを動的にロードする。"""
@@ -473,7 +619,7 @@ class Core(QObject):
             return module
         except Exception:
             self.log("[ERROR] モジュールのロードに失敗: {}".format(path), level="ERROR")
-            print(traceback.format_exc())
+            _safe_print(traceback.format_exc())
             return None
 
     # -- プラグイン管理 -----------------------------------------------------
@@ -503,7 +649,7 @@ class Core(QObject):
                     module.register(self)
                 except Exception:
                     self.log("[ERROR] プラグイン登録に失敗: {}".format(name), level="ERROR")
-                    print(traceback.format_exc())
+                    _safe_print(traceback.format_exc())
         return self._plugins
 
     def log(self, message, level="INFO"):
@@ -515,9 +661,34 @@ class Core(QObject):
                 return
             except Exception:
                 pass
-        print("[{}] {}".format(level, message))
+        try:
+            # --windowed（noconsole）ビルドでは標準出力が無いことがある
+            print("[{}] {}".format(level, message))
+        except Exception:
+            pass
 
     # -- アドオン選択 -------------------------------------------------------
+
+    def _rebuild_url_index(self):
+        """URL パターンの索引を構築する（長いパターンを優先）。
+
+        ``URL_PATTERNS`` の split / lower を入力のたびに繰り返さないよう、
+        アドオン登録時に 1 度だけ展開して長さ降順に並べておく。返り値は
+        ``[(pattern_lower, entry), ...]``。
+        """
+        index = []
+        for entry in self.addons.values():
+            patterns = entry["manifest"].get("URL_PATTERNS", "")
+            seen = set()
+            for pat in patterns.split(","):
+                pat = pat.strip().lower()
+                if pat and pat not in seen:
+                    seen.add(pat)
+                    index.append((pat, entry))
+        index.sort(key=lambda item: len(item[0]), reverse=True)
+        self._url_index = index
+        self._url_index_count = len(self.addons)
+        return index
 
     def find_addon_for_url(self, url):
         """登録された URL パターンから最適なアドオンを自動ジャッジする。
@@ -525,20 +696,19 @@ class Core(QObject):
         複数のアドオンが一致した場合は、より長く一致したパターンを持つものを選ぶ。
         無効化（enabled=False）されたアドオンは対象外。
         """
-        host = (url or "").lower()
-        best = None
-        for entry in self.addons.values():
-            if not entry.get("enabled", True):
-                continue
-            patterns = entry["manifest"].get("URL_PATTERNS", "")
-            for pat in [p.strip() for p in patterns.split(",") if p.strip()]:
-                if pat.lower() in host:
-                    if best is None or len(pat) > best[0]:
-                        best = (len(pat), entry)
-        return best[1] if best else None
+        if not url:
+            return None
+        index = self._url_index
+        if index is None or self._url_index_count != len(self.addons):
+            index = self._rebuild_url_index()
+        host = url.lower()
+        for pattern, entry in index:
+            if entry.get("enabled", True) and pattern in host:
+                return entry
+        return None
 
     def get_addon_options(self, addon):
-        """アドオンが提示する選択肢（画質・音質・拡張子など）を取得する。
+        """アドオンが提示する選択肢（画質・音質・拡張子・ログイン等）を取得する。
 
         アドオンは任意で ``get_options()`` を定義できる。戻り値は次の形式の dict::
 
@@ -547,13 +717,17 @@ class Core(QObject):
                             "default": "mp4"},
                 "quality": {"label": "画質", "options": ["1080p", "720p", "best"],
                             "default": "1080p", "content": "解像度を選択"},
+                "username": {"label": "ログインID", "type": "text", "default": ""},
+                "password": {"label": "パスワード", "type": "password", "default": ""},
             }
 
         - キー: 本体が ``download_logic`` へ渡す ``options`` dict のキー名。
         - ``label``   : GUI に表示する見出し（無ければキー名を使用）。
-        - ``options`` : 選択肢の文字列リスト。
-        - ``default`` : 初期選択値（省略時は先頭）。
-        - ``content`` : 補足説明（任意）。
+        - ``type``    : 入力ウィジェットの種類。``"select"``（既定）/ ``"text"`` /
+          ``"password"``。``select`` 以外では ``options`` は不要。
+        - ``options`` : 選択肢の文字列リスト（``select`` のみ必須）。
+        - ``default`` : 初期値（``select`` は選択肢内の値、その他は自由文字列）。
+        - ``content`` : 補足説明（テキスト入力ではプレースホルダ/ツールチップ）。
 
         ``get_options`` が無い / 例外を出すアドオンは ``{}`` を返し、
         GUI 側は選択 UI を表示しない（後方互換）。
@@ -561,23 +735,49 @@ class Core(QObject):
         Returns:
             dict: 正規化済みのオプション定義。
         """
-        module = addon.get("module") if isinstance(addon, dict) else None
-        func = getattr(module, "get_options", None) if module is not None else None
+        if not isinstance(addon, dict):
+            return {}
+        cache_key = addon.get("manifest", {}).get("ID") or id(addon)
+        cached = self._options_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        module = addon.get("module")
+        try:
+            func = getattr(module, "get_options", None) if module is not None else None
+        except Exception:
+            self.log("[WARN] アドオンの読み込みに失敗", level="ERROR")
+            return {}
         if not callable(func):
+            self._options_cache[cache_key] = {}
             return {}
 
         try:
             raw = func()
         except Exception:
             self.log("[WARN] get_options の取得に失敗", level="ERROR")
-            print(traceback.format_exc())
+            _safe_print(traceback.format_exc())
             return {}
 
-        return self._normalize_options(raw)
+        normalized = self._normalize_options(raw)
+        self._options_cache[cache_key] = normalized
+        return normalized
 
-    @staticmethod
-    def _normalize_options(raw):
-        """アドオンが返した選択肢定義を検証・正規化する。"""
+    #: アドオンが ``get_options()`` で指定できる入力タイプ
+    OPTION_TYPES = ("select", "text", "password")
+
+    @classmethod
+    def _normalize_options(cls, raw):
+        """アドオンが返した選択肢定義を検証・正規化する。
+
+        各項目は ``type`` で入力ウィジェットを選べる（省略時は ``select``）。
+
+        - ``select``  : ドロップダウン。``options``（選択肢リスト）が必須。
+        - ``text``    : 1 行テキスト入力。``options`` は不要。
+        - ``password``: 伏せ字の 1 行入力。``options`` は不要。
+
+        ``select`` 以外は値が自由入力のため、``default`` は任意の文字列を使う。
+        """
         if not isinstance(raw, dict):
             return {}
 
@@ -585,22 +785,41 @@ class Core(QObject):
         for key, spec in raw.items():
             if not isinstance(spec, dict):
                 continue
-            choices = spec.get("options")
-            if not isinstance(choices, (list, tuple)) or not choices:
-                continue
-            choices = [str(c) for c in choices]
 
-            default = spec.get("default", choices[0])
-            default = str(default)
-            if default not in choices:
-                default = choices[0]
+            kind = str(spec.get("type", "select")).lower()
+            if kind not in cls.OPTION_TYPES:
+                kind = "select"
 
-            normalized[str(key)] = {
-                "label": str(spec.get("label", key)),
-                "options": choices,
-                "default": default,
-                "content": str(spec.get("content", "")),
-            }
+            label = str(spec.get("label", key))
+            content = str(spec.get("content", ""))
+
+            if kind == "select":
+                choices = spec.get("options")
+                if not isinstance(choices, (list, tuple)) or not choices:
+                    continue
+                choices = [str(c) for c in choices]
+
+                default = spec.get("default", choices[0])
+                default = str(default)
+                if default not in choices:
+                    default = choices[0]
+
+                normalized[str(key)] = {
+                    "type": "select",
+                    "label": label,
+                    "options": choices,
+                    "default": default,
+                    "content": content,
+                }
+            else:
+                # text / password は options 不要（自由入力）
+                normalized[str(key)] = {
+                    "type": kind,
+                    "label": label,
+                    "options": [],
+                    "default": str(spec.get("default", "")),
+                    "content": content,
+                }
         return normalized
 
     def default_options(self, addon):
@@ -611,11 +830,50 @@ class Core(QObject):
 
     # __UPDATE_METHODS_PLACEHOLDER__
 
+    def http_session(self):
+        """更新取得用の ``requests.Session`` を返す（初回のみ生成）。
+
+        接続を使い回すことで、アドオンごとに ``requests.get`` を呼ぶより
+        TLS ハンドシェイクの回数が減り、更新チェックが速くなる。
+        コネクションプールも広げ、並列チェック時の取りこぼしを防ぐ。
+        """
+        session = self._session
+        if session is not None:
+            return session
+        with self._session_lock:
+            if self._session is not None:
+                return self._session
+
+            import requests
+            from requests.adapters import HTTPAdapter
+
+            session = requests.Session()
+            ua = str(self.config.get("user_agent") or "").strip()
+            if ua:
+                session.headers["User-Agent"] = ua
+            proxy = str(self.config.get("proxy") or "").strip()
+            if proxy:
+                session.proxies.update({"http": proxy, "https": proxy})
+
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=1)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._session = session
+            return session
+
+    def _request_timeout(self, default=15):
+        """config の ``timeout`` を尊重した (connect, read) タイムアウトを返す。"""
+        try:
+            value = float(self.config.get("timeout", default) or default)
+        except Exception:
+            value = float(default)
+        value = max(1.0, min(value, 120.0))
+        return (min(value, 10.0), value)
+
     def _fetch_json(self, url):
         """JSON を取得する。失敗時はログを残して None を返す。"""
         try:
-            import requests
-            resp = requests.get(url, timeout=10)
+            resp = self.http_session().get(url, timeout=self._request_timeout(10))
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -625,8 +883,7 @@ class Core(QObject):
     def _fetch_text(self, url):
         """テキスト（本体/アドオンのソース）を取得する。失敗時は None を返す。"""
         try:
-            import requests
-            resp = requests.get(url, timeout=20)
+            resp = self.http_session().get(url, timeout=self._request_timeout(20))
             resp.raise_for_status()
             return resp.text
         except Exception as e:
@@ -683,8 +940,23 @@ class Core(QObject):
         if not self._update_due():
             return "更新チェックをスキップしました（前回チェックから間隔未満）"
 
-        app_result = self.check_app_update()
-        addon_result = self.auto_update_addons()
+        # 本体とアドオンの更新チェックは互いに独立なので並列に行う
+        # （ネットワーク待ちが支配的なため、直列より待ち時間が短くなる）
+        app_result = "スキップ"
+        addon_result = "スキップ"
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="upd") as executor:
+                app_future = executor.submit(self.check_app_update)
+                addon_future = executor.submit(self.auto_update_addons)
+                app_result = app_future.result()
+                addon_result = addon_future.result()
+        except Exception as e:
+            self.log("[UPDATE] 更新チェックに失敗: {}".format(e), level="ERROR")
+            app_result = app_result if app_result != "スキップ" else "失敗"
+            addon_result = addon_result if addon_result != "スキップ" else "失敗"
+
         self._mark_update_checked()
 
         result = "本体: {} / アドオン: {}".format(app_result, addon_result)
@@ -792,57 +1064,78 @@ class Core(QObject):
             return "addons フォルダがありません"
 
         manifest_name = self.config.get("update_manifest", "manifest.json")
-        updated, failed, no_repo = [], [], []
 
-        for filename in sorted(os.listdir(ADDONS_DIR)):
-            if not filename.endswith(".py") or filename.startswith("_"):
-                continue
+        def _process(filename):
+            """1 アドオン分の更新チェック（並列ワーカーから呼ばれる）。"""
             local_path = os.path.join(ADDONS_DIR, filename)
-            manifest, _text = read_manifest(local_path)
+            text = read_text(local_path)
+            manifest = parse_manifest(text) if text is not None else None
             if not manifest:
-                continue
+                return None
 
             addon_id = manifest.get("ID", filename)
             # REPO は github.com の HTML URL でも受け付ける（raw ベースへ正規化）
             repo = normalize_repo_url(manifest.get("REPO"))
             if not repo:
-                no_repo.append(addon_id)
-                continue
+                return ("no_repo", addon_id)
 
             remote = self._fetch_json(join_url(repo, manifest_name))
             if remote is None:
-                failed.append("{} (マニフェスト取得失敗)".format(addon_id))
-                continue
+                return ("failed", "{} (マニフェスト取得失敗)".format(addon_id))
 
             entry = self._find_remote_addon(remote, addon_id, filename)
             if not entry:
-                continue
+                return None
 
             remote_version = str(entry.get("version", "")).strip()
             local_version = manifest.get("VERSION", "0.0.0")
             if not version_gt(remote_version, local_version):
-                continue
+                return None
 
             rel = str(entry.get("path") or "addons/{}".format(entry.get("file") or filename))
             content = self._fetch_text(join_url(repo, rel))
             if content is None:
-                failed.append("{} (ダウンロード失敗)".format(addon_id))
-                continue
+                return ("failed", "{} (ダウンロード失敗)".format(addon_id))
 
             # 更新ファイルもセキュリティスキャンしてから配置
             safe, reason = scan_text(content, self.guard.blocked_keywords)
             if not safe:
                 self.log("[SECURITY] 更新を拒否: {} ({})".format(filename, reason))
-                failed.append("{} (セキュリティ拒否)".format(addon_id))
-                continue
+                return ("failed", "{} (セキュリティ拒否)".format(addon_id))
 
             tmp_path = local_path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(content)
             os.replace(tmp_path, local_path)
-            updated.append("{} v{} -> v{}".format(filename, local_version, remote_version))
             self.log("[UPDATE] アドオン更新: {} v{} -> v{}".format(
                 filename, local_version, remote_version))
+            return ("updated", "{} v{} -> v{}".format(
+                filename, local_version, remote_version))
+
+        filenames = [name for name in sorted(os.listdir(ADDONS_DIR))
+                     if name.endswith(".py") and not name.startswith("_")]
+
+        # アドオンごとの更新チェックは独立なので並列化する（順序は保持）
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(filenames))),
+                                    thread_name_prefix="upd-addon") as executor:
+                results = list(executor.map(_process, filenames))
+        except Exception as e:
+            self.log("[UPDATE] アドオン更新の並列実行に失敗: {}".format(e), level="ERROR")
+            results = [_process(name) for name in filenames]
+
+        updated, failed, no_repo = [], [], []
+        for item in results:
+            if not item:
+                continue
+            kind, message = item
+            if kind == "updated":
+                updated.append(message)
+            elif kind == "failed":
+                failed.append(message)
+            elif kind == "no_repo":
+                no_repo.append(message)
 
         parts = []
         if updated:

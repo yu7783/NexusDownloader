@@ -29,7 +29,31 @@ import sys
 # パス / 定数
 # ---------------------------------------------------------------------------
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+def is_frozen():
+    """ビルド済み（PyInstaller / Nuitka など）の実行かどうかを返す。
+
+    ビルド済みの場合、``.py`` を差し替えても動作は変わらないため、
+    本体の自動更新（ソース差し替え方式）は利用できない。
+    """
+    if getattr(sys, "frozen", False):
+        return True
+    return "__compiled__" in globals()
+
+
+def _app_base_dir():
+    """アプリの基準ディレクトリを返す。
+
+    PyInstaller / Nuitka でビルドした場合は ``__file__`` が一時展開先
+    （PyInstaller onefile の ``_MEIPASS`` など）を指すため、ユーザーの
+    ``config.json`` / ``addons/`` を読めない。ビルド済みなら実行ファイルの
+    隣を基準にする。
+    """
+    if is_frozen():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = _app_base_dir()
 UPDATE_DIR = os.path.join(BASE_DIR, "update")
 FILES_DIR = os.path.join(UPDATE_DIR, "files")
 BACKUP_DIR = os.path.join(UPDATE_DIR, "backup")
@@ -47,17 +71,6 @@ PROTECTED_FILES = ("config.json",)
 # ---------------------------------------------------------------------------
 # 環境判定 / 共通ヘルパ
 # ---------------------------------------------------------------------------
-
-def is_frozen():
-    """ビルド済み（PyInstaller / Nuitka など）の実行かどうかを返す。
-
-    ビルド済みの場合、``.py`` を差し替えても動作は変わらないため、
-    本体の自動更新（ソース差し替え方式）は利用できない。
-    """
-    if getattr(sys, "frozen", False):
-        return True
-    return "__compiled__" in globals()
-
 
 def _safe_relpath(path):
     """BASE_DIR 配下に収まる相対パスだけを許可する（``..`` や絶対パスを拒否）。
@@ -86,7 +99,11 @@ def _safe_relpath(path):
 
 def _log(message):
     """標準出力へ更新ログを出す（GUI 初期化前にも呼ばれるため print を使う）。"""
-    print("[UPDATER] {}".format(message))
+    try:
+        print("[UPDATER] {}".format(message))
+    except Exception:
+        # --windowed ビルドでは標準出力が無いことがある
+        pass
 
 
 # ---------------------------------------------------------------------------

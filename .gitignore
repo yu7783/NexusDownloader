@@ -10,6 +10,14 @@ venv/
 .eggs/
 *.egg-info/
 
+# --- PyInstaller build artifacts ---
+dist/
+*.spec.bak
+
+# --- Release archives (GitHub Release の添付ファイル) ---
+NexusDownloader-*.zip
+selftest*.json
+
 # --- Nuitka build artifacts ---
 build/
 main.build/

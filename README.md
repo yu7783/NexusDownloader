@@ -16,7 +16,8 @@ PyQt6 + PyQt-Fluent-Widgets による Windows 11 純正風のモダンな UI、`
 | マルチスレッド | ダウンロードは別スレッド実行で GUI は絶対にフリーズしない |
 | 複数 URL の並列ダウンロード | 改行区切りで複数 URL を貼り付けると、`parallel` 数の並列で同時ダウンロード |
 | 自動アップデート | **本体** は `config.json` の repo から、**各アドオン** は自分の `REPO` から個別に取得 |
-| アドオン定義の選択 UI | アドオンの `get_options()` が画質・音質・拡張子などの選択肢を提示し、GUI に自動表示 |
+| アドオン定義の選択 UI | アドオンの `get_options()` が画質・音質・拡張子・**ログイン情報（テキスト / パスワード入力）** などを提示し、GUI に自動表示 |
+| ログイン対応 | yt-dlp アドオンがブラウザ Cookie / cookies.txt / ID・パスワードでログイン（ニコニコの年齢制限動画など） |
 | 速度テスト & 並列最適化 | 帯域を実測し最適な並列数・チャンクサイズを自動適用 |
 | フル GUI 設定 | 設定タブから `config.json` を動的に編集・保存 |
 
@@ -95,6 +96,35 @@ pip install PyQt6 PyQt6-Fluent-Widgets requests yt-dlp
 ```bash
 python main.py
 ```
+
+---
+
+## 🏗️ exe ビルド（Windows）
+
+PyInstaller の **onedir** 形式でビルドします（onefile は起動のたびに一時展開するため遅い）。
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+
+出力は `dist\NexusDownloader\NexusDownloader.exe` です。`config.json` / `addons\` /
+`plugins\` は **exe と同じフォルダ** にコピーされるため、後からアドオンを追加・更新できます。
+配布するときは `dist\NexusDownloader\` フォルダごと配布してください。
+
+動作確認（GUI を起動せず、アドオンの読み込みと依存関係を検証）:
+
+```powershell
+.\dist\NexusDownloader\NexusDownloader.exe --self-test selftest.json
+```
+
+### 最適化のポイント
+
+- アドオンは起動時に **テキストの解析だけ** を行い、重い `import`（yt-dlp など）は
+  初回利用時まで遅延。ウィンドウ表示後にバックグラウンドで先読みします。
+- `config.json` の `timeout` / `proxy` / `user_agent` を尊重した接続再利用セッションで
+  更新チェック・速度テストを行う。
+- 頻発していた進捗通知は 10 回/秒に間引き、全体進捗は差分計算（O(1)）に変更。
+- 画像ギャラリー系アドオンは接続プールを並列数に合わせ、チャンクサイズを拡大。
 
 ---
 
@@ -205,7 +235,7 @@ https://site-c.example/page/3
 # --- ADDON_MANIFEST ---
 # ID: yt_dlp_core
 # NAME: Universal Video Addon (yt-dlp)
-# VERSION: 1.1.0
+# VERSION: 1.2.0
 # URL_PATTERNS: youtube.com, youtu.be
 # REPO: https://raw.githubusercontent.com/yu7783/NexusDownloader-Addons/main
 # ----------------------
@@ -291,11 +321,39 @@ nuitka --standalone --onefile \
 
 ---
 
+## 🔐 ログインが必要なサイト（ニコニコ動画など）
+
+同梱の yt-dlp アドオンは、URL を入力すると「ダウンロード設定」に **ログイン** 項目を表示します。
+ニコニコ動画の年齢制限動画（`Sensitive content, login required`）などは、次のいずれかで
+ログイン情報を渡すと取得できます。
+
+| 方法 | 操作 | 備考 |
+|---|---|---|
+| ブラウザのCookie（推奨） | 「ログイン」→「ブラウザのCookie」→ 普段ログインしているブラウザを選択 | 2 段階認証もそのまま利用可。ブラウザを起動したままだと失敗する場合あり |
+| Cookiesファイル | 「ログイン」→「Cookiesファイル」→ Netscape 形式 `cookies.txt` のパスを入力 | 空欄ならアプリ直下の `cookies.txt` を自動使用 |
+| IDとパスワード | 「ログイン」→「IDとパスワード」→ ID / パスワード（必要なら 2 段階認証コード）を入力 | 入力値は保存されません |
+
+> 💡 GUI にログイン項目が出ない **旧バージョンの本体**（`type` 未対応）でも、
+> `config.json` に次のキーを書いておけば同じ動作になります。
+
+```json
+{
+    "login": "ブラウザのCookie",
+    "login_browser": "Chrome",
+    "cookies_file": "C:/path/to/cookies.txt",
+    "username": "you@example.com",
+    "password": "********",
+    "twofactor": "123456"
+}
+```
+
+---
+
 ## 🧩 アドオン・プラグインを作る
 
 - アドオンの作り方 → [`How to develop addon.md`](How%20to%20develop%20addon.md)
 - プラグインの作り方 → [`How to develop plugin.md`](How%20to%20develop%20plugin.md)
-- GitHub への公開手順（本体 + アドオン別リポジトリ） → [`PUBLISHING.md`](PUBLISHING.md)
+
 
 ---
 
