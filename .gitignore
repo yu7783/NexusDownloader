@@ -31,6 +31,18 @@ main.onefile-build/
 downloads/
 logs/
 
+# --- Android 版は別リポジトリ (NexusDownloader-Android) で管理 ---
+/android/
+
+# --- 一時的な調査・ビルドログ ---
+.testartifacts/
+build_out.txt
+.jphits.txt
+jpscan.txt
+jp_literals_now.txt
+Downloader.lnk
+desktop.ini
+
 # --- 本体の自動更新ステージング / 適用時のバックアップ ---
 update/
 *.bak

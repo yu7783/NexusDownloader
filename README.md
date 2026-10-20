@@ -4,6 +4,8 @@
 
 PyQt6 + PyQt-Fluent-Widgets による Windows 11 純正風のモダンな UI、`importlib` による動的ロード、危険コードの自動ブロック、マルチスレッド実行、GitHub からの自動アップデートを備えています。
 
+> **Android 版**: [NexusDownloader-Android](https://github.com/yu7783/NexusDownloader-Android)（Kotlin / Jetpack Compose / Material 3）
+
 ---
 
 ## ✨ 主な特徴
