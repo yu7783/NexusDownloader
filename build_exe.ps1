@@ -57,6 +57,14 @@ if ($Addons.Count -gt 0) {
 }
 $selected | ForEach-Object { Copy-Item $_.FullName -Destination $addonsDst -Force }
 
+# アイコン等のアセット（exe の隣にも置き、ウィンドウアイコンに使う）
+$assetsSrc = Join-Path $PSScriptRoot "assets"
+if (Test-Path $assetsSrc) {
+    $assetsDst = Join-Path $dist "assets"
+    New-Item -ItemType Directory -Force -Path $assetsDst | Out-Null
+    Copy-Item (Join-Path $assetsSrc "*") -Destination $assetsDst -Force
+}
+
 # プラグイン用フォルダ（空でも作成）
 New-Item -ItemType Directory -Force -Path (Join-Path $dist "plugins") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dist "downloads") | Out-Null

@@ -34,6 +34,9 @@ hiddenimports += [
     "PyQt6.QtNetwork",
 ]
 
+# ウィンドウ / タスクバー用アイコン（exe にも埋め込む）
+datas += [("assets/nexus.ico", "assets")]
+
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -95,6 +98,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="NexusDownloader",
+    icon="assets/nexus.ico",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

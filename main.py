@@ -19,7 +19,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -94,6 +94,22 @@ from security import scan_text  # noqa: E402
 # config.json / addons/ を exe と同じ場所に置いて更新できるようにする。
 BASE_DIR = updater.BASE_DIR
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
+
+def app_icon_path():
+    """アプリアイコン（assets/nexus.ico）の実在パスを返す。
+
+    ビルド済みでは exe の隣の ``assets/`` を優先し、無ければ PyInstaller が
+    同梱した ``_internal/assets/``（``sys._MEIPASS``）を使う。
+    """
+    candidates = [
+        os.path.join(BASE_DIR, "assets", "nexus.ico"),
+        os.path.join(getattr(sys, "_MEIPASS", BASE_DIR), "assets", "nexus.ico"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return ""
 
 # ---------------------------------------------------------------------------
 # アプリ情報（About タブで使用）
@@ -1622,6 +1638,9 @@ class MainWindow(FluentWindow):
         super().__init__()
         self.core = core
         self.setWindowTitle(APP_NAME)
+        icon_path = app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
         self.resize(980, 680)
 
         self.download_interface = DownloadInterface(core, self)
@@ -1733,7 +1752,21 @@ def main():
     except Exception:
         pass
 
+    # Windows のタスクバーで exe のアイコンが正しく使われるようにする
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "yu7783.NexusDownloader")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    icon_path = app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
 
     core = Core(config)
     core.load_plugins()    # プラグインを先にロード（logger 等を利用可能に）
